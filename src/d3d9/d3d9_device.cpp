@@ -834,6 +834,9 @@ MTLD3D9Device::releaseBufferBacking(
 }
 
 MTLD3D9Device::~MTLD3D9Device() {
+  // Diagnostic pins must not outlive the device fields their release uses.
+  m_smbTargets.clear();
+  m_smbTextures.clear();
   // Buffer wrappers can drop their last reference from ANY later member's
   // destructor (the encode-side refs, a bound stream, an unfinished
   // recording block), and member teardown runs after the backing pool's
@@ -1593,6 +1596,29 @@ MTLD3D9Device::stageTextureUpload(
   QueueBlitOp(std::move(op));
   // ml1490: counted here, settled by the caller at a safe boundary.
   noteUploadBytes(total_bytes);
+  if (d9SmbTraceEnabled() && m_smbFrame <= 120) {
+    auto &record = m_smbTextures[dst_alloc.ptr()];
+    record.texture = dst_alloc; // prevent pointer reuse during the bounded trace
+    record.bytes += total_bytes;
+    if (!is_compressed && (dst_alloc->pixelFormat() == WMTPixelFormatBGRA8Unorm ||
+                           dst_alloc->pixelFormat() == WMTPixelFormatBGRX8Unorm)) {
+      const auto *pixels = reinterpret_cast<const uint8_t *>(staged);
+      uint64_t nonblack = 0;
+      for (uint32_t y = 0; y < size.height; ++y)
+        for (uint32_t x = 0; x < size.width; ++x) {
+          const auto *p = pixels + size_t(y) * src_pitch + x * 4;
+          nonblack += (p[0] | p[1] | p[2]) != 0;
+        }
+      const auto *p = pixels + size_t(size.height / 2) * src_pitch + (size.width / 2) * 4;
+      Logger::info(str::format("[smb] upload-content tex=", dst_alloc.ptr(), " mip=", mip_level,
+          " nonblack-pixels=", nonblack, " center RGBA=", unsigned(p[2]), ",", unsigned(p[1]), ",",
+          unsigned(p[0]), ",", unsigned(p[3])));
+    }
+    Logger::info(str::format("[smb] upload frame=", m_smbFrame, " tex=", dst_alloc.ptr(),
+        " metal=", dst.handle, " mip=", mip_level, " slice=", slice,
+        " extent=", size.width, "x", size.height, " pitch=", src_pitch,
+        " staged-bytes=", total_bytes, " total=", record.bytes));
+  }
 }
 
 bool
@@ -1605,6 +1631,162 @@ MTLD3D9Device::waitForGpuOrDeviceError(uint64_t value) {
       return false;
   }
   return true;
+}
+
+bool
+MTLD3D9Device::smbTraceActive() const {
+  return d9SmbTraceEnabled() && (m_smbFrame < 12 || m_smbFrame == 60 || m_smbFrame == 120);
+}
+
+void
+MTLD3D9Device::smbTraceSurface(const char *label, MTLD3D9Surface *surface) {
+  if (!surface) {
+    Logger::info(str::format("[smb] ", label, " null"));
+    return;
+  }
+  const auto &d = surface->desc();
+  Logger::info(str::format("[smb] ", label, " surface=", surface, " tex=", surface->dxmtTexture().ptr(),
+      " metal=", surface->metalTexture().handle, " extent=", d.Width, "x", d.Height,
+      " fmt=", uint32_t(d.Format), " mip=", surface->mipLevel(), " slice=", surface->arraySlice()));
+}
+
+void
+MTLD3D9Device::smbTraceDraw() {
+  auto shader_hash = [](auto *shader) -> uint64_t {
+    return shader ? bytecode_hash(shader->bytecode(), shader->bytecodeByteLength() / sizeof(DWORD)) : 0;
+  };
+  const auto *rs = m_renderStates;
+  Logger::info(str::format("[smb] draw=", ++m_smbDraw, " frame=", m_smbFrame,
+      " vs-hash=", shader_hash(m_vertexShader.ptr()), " ps-hash=", shader_hash(m_pixelShader.ptr()),
+      " vs-version=", m_vertexShader ? m_vertexShader->bytecode()[0] : 0,
+      " ps-version=", m_pixelShader ? m_pixelShader->bytecode()[0] : 0,
+      " const-set-vs/ps=", m_vsConstFMax, "/", m_psConstFMax,
+      " const-read-vs/ps=", m_vertexShader ? m_vertexShader->metadata().max_float_const_index : 0,
+      "/", m_pixelShader ? m_pixelShader->metadata().max_float_const_index : 0,
+      " fvf=", m_fvf, " positionT=", m_vertexDeclaration && m_vertexDeclaration->hasPositionT(),
+      " colorwrite=", rs[D3DRS_COLORWRITEENABLE], " blend=", rs[D3DRS_ALPHABLENDENABLE],
+      " src/dst/op=", rs[D3DRS_SRCBLEND], "/", rs[D3DRS_DESTBLEND], "/", rs[D3DRS_BLENDOP],
+      " separate-alpha=", rs[D3DRS_SEPARATEALPHABLENDENABLE],
+      " alpha-src/dst/op=", rs[D3DRS_SRCBLENDALPHA], "/", rs[D3DRS_DESTBLENDALPHA], "/", rs[D3DRS_BLENDOPALPHA],
+      " alpha-test/func/ref=", rs[D3DRS_ALPHATESTENABLE], "/", rs[D3DRS_ALPHAFUNC], "/", rs[D3DRS_ALPHAREF],
+      " srgb-write=", rs[D3DRS_SRGBWRITEENABLE], " z/func/write=", rs[D3DRS_ZENABLE], "/", rs[D3DRS_ZFUNC], "/", rs[D3DRS_ZWRITEENABLE],
+      " cull=", rs[D3DRS_CULLMODE], " fog=", rs[D3DRS_FOGENABLE],
+      " viewport=", m_viewport.X, ",", m_viewport.Y, ",", m_viewport.Width, ",", m_viewport.Height,
+      ",", m_viewport.MinZ, ",", m_viewport.MaxZ,
+      " scissor=", rs[D3DRS_SCISSORTESTENABLE], ":", m_scissorRect.left, ",", m_scissorRect.top,
+      ",", m_scissorRect.right, ",", m_scissorRect.bottom,
+      " stream0-offset/stride=", m_streamOffsets[0], "/", m_streamStrides[0]));
+  for (auto &rt : m_renderTargets) {
+    if (!rt) continue;
+    smbTraceSurface("draw-target", rt.ptr());
+    auto &record = m_smbTextures[rt->dxmtTexture().ptr()];
+    record.texture = rt->dxmtTexture();
+    ++record.draws;
+    bool seen = false;
+    for (auto &old : m_smbTargets) seen |= old.ptr() == rt.ptr();
+    if (!seen) m_smbTargets.emplace_back(rt);
+  }
+  for (unsigned i = 0; i < D3D9_MAX_TEXTURE_UNITS; ++i) {
+    auto *t = m_textures[i].ptr();
+    if (!t || !t->dxmtTexture()) continue;
+    auto &record = m_smbTextures[t->dxmtTexture().ptr()];
+    record.texture = t->dxmtTexture();
+    Logger::info(str::format("[smb] sampler=", i, " tex=", t->dxmtTexture().ptr(),
+        " metal=", t->metalTexture().handle, " extent=", t->dxmtTexture()->width(), "x", t->dxmtTexture()->height(),
+        " fmt=", uint32_t(t->d3dFormat()), " staged-bytes-ever=", record.bytes,
+        " traced-draws-to-texture=", record.draws, " srgb=", m_samplerStates[i][D3DSAMP_SRGBTEXTURE],
+        " min/mag/mip=", m_samplerStates[i][D3DSAMP_MINFILTER], "/", m_samplerStates[i][D3DSAMP_MAGFILTER],
+        "/", m_samplerStates[i][D3DSAMP_MIPFILTER]));
+  }
+  if (m_vertexDeclaration && m_smbDraw <= 32)
+    for (UINT i = 0; i < m_vertexDeclaration->elementCount(); ++i) {
+      const auto &e = m_vertexDeclaration->elements()[i];
+      Logger::info(str::format("[smb] declaration stream=", e.Stream, " offset=", e.Offset,
+          " type=", unsigned(e.Type), " usage/index=", unsigned(e.Usage), "/", unsigned(e.UsageIndex)));
+    }
+  for (unsigned i = 0; i < 4; ++i)
+    Logger::info(str::format("[smb] c", i, " vs=", m_vsConstantsF[i][0], ",", m_vsConstantsF[i][1], ",",
+        m_vsConstantsF[i][2], ",", m_vsConstantsF[i][3], " ps=", m_psConstantsF[i][0], ",",
+        m_psConstantsF[i][1], ",", m_psConstantsF[i][2], ",", m_psConstantsF[i][3]));
+}
+
+void
+MTLD3D9Device::smbReadPixels(const char *label, MTLD3D9Surface *surface) {
+  if (!surface || !surface->dxmtTexture()) return;
+  const auto &d = surface->desc();
+  smbTraceSurface(label, surface);
+  if ((d.Format != D3DFMT_A8R8G8B8 && d.Format != D3DFMT_X8R8G8B8) ||
+      d.MultiSampleType != D3DMULTISAMPLE_NONE || !d.Width || !d.Height) {
+    Logger::info("[smb] readback skipped: requires single-sample fmt 21/22");
+    return;
+  }
+  auto pool = WMT::MakeAutoreleasePool();
+  FlushDrawBatch();
+  flushOpenWork();
+  const uint64_t signal = m_currentCmdSeq;
+  // A 32x16 grid of single-pixel copies: a coarse picture of the whole target, so a
+  // frame whose sprites miss the centre and corner still shows what it holds.
+  constexpr unsigned kCols = 32, kRows = 16;
+  auto span = tryRingAllocate(m_uploadRing, signal, m_cachedSignaled.load(std::memory_order_acquire),
+                              kCols * kRows * 4, 256);
+  if (!span) { Logger::warn("[smb] readback allocation failed"); return; }
+  auto texture = surface->dxmtTexture();
+  const uint32_t mip = surface->mipLevel(), slice = surface->arraySlice();
+  const uint32_t width = d.Width, height = d.Height;
+  const auto buffer = span.handle;
+  const auto offset = span.offset;
+  const auto event = m_completionEvent.handle;
+  m_dxmtQueue->CurrentChunk()->emitcc([texture, mip, slice, width, height, buffer, offset, event, signal](ArgumentEncodingContext &ctx) {
+    ctx.startBlitPass();
+    auto view = ctx.access<false>(texture, mip, slice, DXMT_ENCODER_RESOURCE_ACESS_READ);
+    for (unsigned i = 0; i < kCols * kRows; ++i) {
+      auto &cmd = ctx.encodeBlitCommand<wmtcmd_blit_copy_from_texture_to_buffer>();
+      cmd.type = WMTBlitCommandCopyFromTextureToBuffer;
+      cmd.src = view.handle;
+      cmd.slice = slice;
+      cmd.level = mip;
+      cmd.origin = WMTOrigin{(2 * (i % kCols) + 1) * width / (2 * kCols), (2 * (i / kCols) + 1) * height / (2 * kRows), 0};
+      cmd.size = WMTSize{1, 1, 1};
+      cmd.dst = buffer;
+      cmd.offset = offset + i * 4;
+      cmd.bytes_per_row = 4;
+      cmd.bytes_per_image = 4;
+    }
+    ctx.endPass();
+    ctx.signalEventByHandle(event, signal);
+  });
+  ++m_currentCmdSeq;
+  const uint64_t seq = m_dxmtQueue->CurrentSeqId();
+  commitCurrentChunkTimed(3);
+  m_dxmtQueue->WaitCPUFence(seq);
+  if (!waitForGpuOrDeviceError(signal)) { Logger::warn("[smb] readback GPU failed"); return; }
+  // Read before another ring allocation can recycle this completed span.
+  const auto *bytes = static_cast<const uint8_t *>(span.host);
+  unsigned lit = 0;
+  for (unsigned y = 0; y < kRows; ++y) {
+    char row[kCols + 1];
+    for (unsigned x = 0; x < kCols; ++x) {
+      const auto *p = bytes + (y * kCols + x) * 4;   // BGRA
+      const unsigned luma = (unsigned(p[2]) * 3 + unsigned(p[1]) * 6 + unsigned(p[0])) / 10;
+      row[x] = char('0' + std::min(9u, luma / 26));
+      if (luma > 8) ++lit;
+    }
+    row[kCols] = 0;
+    Logger::info(str::format("[smb] map frame=", m_smbFrame, " ", label, " ", width, "x", height, " row=", y, " ", row));
+  }
+  Logger::info(str::format("[smb] pixels frame=", m_smbFrame, " ", label, " lit=", lit, "/", kCols * kRows));
+}
+
+void
+MTLD3D9Device::smbTracePresent(MTLD3D9Surface *backbuffer) {
+  if (smbTraceActive()) {
+    Logger::info(str::format("[smb] before-Present frame=", m_smbFrame));
+    for (auto &rt : m_smbTargets)
+      if (rt.ptr() != backbuffer) smbReadPixels("offscreen", rt.ptr());
+    smbReadPixels("backbuffer", backbuffer);
+  }
+  m_smbTargets.clear();
+  if (++m_smbFrame == 121) m_smbTextures.clear();
 }
 
 void
@@ -2568,6 +2750,31 @@ HRESULT STDMETHODCALLTYPE
 MTLD3D9Device::Reset(D3DPRESENT_PARAMETERS *pPresentationParameters) {
   D3D9_CENSUS(D3D9_CENSUS_MTLD3D9Device_Reset);
   D9DeviceLock lock = LockDevice();
+  // ml2330: [d3d9-reset] reports what Reset actually returned. The
+  // [d3d9-modes] line is written before the losable-resource gate and reads
+  // hr 0x0 even when the gate then fails the call: Borderlands: The Pre-
+  // Sequel on the native frontend logged 46 such "successful" Resets in a row
+  // after a resolution change and never presented again. The losable count
+  // before the call is what tells a held DEFAULT resource apart from a failed
+  // swapchain rebuild. First 16, then every 64th, so a retry loop stays legible.
+  const uint32_t losable = losableResourceCount();
+  const HRESULT hr = resetDevice(pPresentationParameters);
+  static std::atomic<uint32_t> s_resets{0};
+  const uint32_t n = s_resets.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (n <= 16 || n % 64 == 0) {
+    const D3DPRESENT_PARAMETERS *p = pPresentationParameters;
+    Logger::info(str::format(
+        "[d3d9-reset] ml2330 #", n, m_isEx ? " Ex" : "", " ", p ? p->BackBufferWidth : 0u, "x",
+        p ? p->BackBufferHeight : 0u, " windowed=", p ? (int)p->Windowed : -1, " losable-before=", losable,
+        " after=", losableResourceCount(), " -> hr 0x", std::hex, (uint32_t)hr, std::dec,
+        hr == D3DERR_INVALIDCALL && losable ? " (app still holds DEFAULT-pool resources)" : ""
+    ));
+  }
+  return hr;
+}
+
+HRESULT
+MTLD3D9Device::resetDevice(D3DPRESENT_PARAMETERS *pPresentationParameters) {
   // Wine's main thread has no outer NSAutoreleasePool. Reset tears
   // down and recreates the backbuffer + auto-DS, each of which routes
   // through Metal APIs that return autoreleased handles (newBuffer,
@@ -3515,24 +3722,38 @@ MTLD3D9Device::CreateCubeTexture(
   *ppCubeTexture = tex;
   return D3D_OK;
 }
-// Storage for a d3d9 vertex / index buffer; the buffer object wraps the
-// returned dxmt::Buffer in a dxmt::DynamicBuffer. A CPU-writable allocation the
-// GPU reads, plus a process-owned host mirror the app writes and the consuming
-// draw stores into that allocation. The class must match the one DynamicBuffer
-// hands to later generations, since a refresh stores into whichever name is
-// current. The mirror is never registered with Metal, so the lockable pointer
-// stays in the 32-bit guest address space and no unix-side host-mapping path is
-// involved; the allocation is Metal-owned and the application never sees it.
-// dxmt::Buffer::allocate builds its own WMTBufferInfo per newBuffer, so no info
-// is reused across calls.
-static bool
-allocateD3D9BufferStorage(WMT::Device device, UINT length, Rc<dxmt::Buffer> &out_buffer, void *&out_mirror) {
+// Try the surface-style no-copy backing first. The winemetal requirement is
+// rejected in remote mode; a shadow must never masquerade as direct mapping.
+bool
+allocateD3D9BufferStorage(WMT::Device device, UINT length, D3DPOOL pool, Rc<dxmt::Buffer> &out_buffer,
+                         void *&out_mirror, bool &out_watch, bool allow_alias) {
+  static const bool alias_enabled = env::getEnvVar("DXMT_D9_BUFFER_ALIAS") != "0";
+  if (allow_alias && alias_enabled && length >= (256u << 10) &&
+      (pool == D3DPOOL_DEFAULT || pool == D3DPOOL_MANAGED)) {
+    Rc<dxmt::Buffer> direct = new dxmt::Buffer(length, device, {guest_alloc, guest_free});
+    auto allocation = direct->allocate({}, "d3d9 aliased buffer");
+    if (allocation->buffer() && allocation->mappedMemory(0)) {
+      out_mirror = allocation->mappedMemory(0);
+      std::memset(out_mirror, 0, length);
+      direct->rename(std::move(allocation));
+      out_buffer = std::move(direct);
+      out_watch = false;
+      return true;
+    }
+  }
   Rc<dxmt::Buffer> buffer = new dxmt::Buffer(length, device);
   auto allocation = buffer->allocate(BufferAllocationFlag::CpuWriteCombined);
   if (allocation == nullptr || allocation->buffer().handle == 0)
     return false;
   buffer->rename(std::move(allocation));
-  void *mirror = guest_alloc(length, DXMT_PAGE_SIZE);
+  // All VB/IB mirrors can be refreshed at draw time, regardless of DYNAMIC, but
+  // only a large one is worth its own write-watched reservation: each takes at
+  // least 64 KB of a 32-bit game's address space, a game can create thousands of
+  // small buffers, and copying a small mirror whole costs little. The cost this
+  // removes is the 8-16 MB streaming buffer re-copied per draw (Unreal Engine 3).
+  out_watch = false;
+  void *mirror = length >= (256u << 10) ? guest_alloc_watch(length, DXMT_PAGE_SIZE, out_watch)
+                                        : guest_alloc(length, DXMT_PAGE_SIZE);
   if (!mirror)
     return false;
   std::memset(mirror, 0, length);
@@ -3610,15 +3831,15 @@ MTLD3D9Device::CreateVertexBuffer(
     return D3DERR_INVALIDCALL;
   }
 
-  // Storage (d3d9_buffer_map.hpp): a CPU-writable allocation wrapped in a
-  // DynamicBuffer inside the buffer object, plus a host mirror the app writes
-  // and the consuming draw stores into that allocation.
+  // DynamicBuffer owns either directly mapped guest generations or the
+  // GPU allocations published from a separate mirror (d3d9_buffer_map.hpp).
   void *host_ptr = nullptr;
+  bool write_watch = false;
   Rc<dxmt::Buffer> dxmt_buffer{};
-  if (!allocateD3D9BufferStorage(m_metalDevice, Length, dxmt_buffer, host_ptr))
+  if (!allocateD3D9BufferStorage(m_metalDevice, Length, Pool, dxmt_buffer, host_ptr, write_watch))
     return D3DERR_OUTOFVIDEOMEMORY;
 
-  auto *vb = new MTLD3D9VertexBuffer(this, Length, Usage, FVF, Pool, host_ptr, std::move(dxmt_buffer));
+  auto *vb = new MTLD3D9VertexBuffer(this, Length, Usage, FVF, Pool, host_ptr, write_watch, std::move(dxmt_buffer));
   if (Pool == D3DPOOL_DEFAULT)
     vb->markLosable();
   vb->AddRef();
@@ -3688,11 +3909,12 @@ MTLD3D9Device::CreateIndexBuffer(
 
   // Storage: see CreateVertexBuffer.
   void *host_ptr = nullptr;
+  bool write_watch = false;
   Rc<dxmt::Buffer> dxmt_buffer{};
-  if (!allocateD3D9BufferStorage(m_metalDevice, Length, dxmt_buffer, host_ptr))
+  if (!allocateD3D9BufferStorage(m_metalDevice, Length, Pool, dxmt_buffer, host_ptr, write_watch))
     return D3DERR_OUTOFVIDEOMEMORY;
 
-  auto *ib = new MTLD3D9IndexBuffer(this, Length, Usage, Format, Pool, host_ptr, std::move(dxmt_buffer));
+  auto *ib = new MTLD3D9IndexBuffer(this, Length, Usage, Format, Pool, host_ptr, write_watch, std::move(dxmt_buffer));
   if (Pool == D3DPOOL_DEFAULT)
     ib->markLosable();
   ib->AddRef();
@@ -3990,6 +4212,11 @@ MTLD3D9Device::UpdateSurface(
 ) {
   D3D9_CENSUS(D3D9_CENSUS_MTLD3D9Device_UpdateSurface);
   D9DeviceLock lock = LockDevice();
+  if (d9SmbTraceEnabled() && m_smbFrame <= 120) {
+    Logger::info(str::format("[smb] UpdateSurface frame=", m_smbFrame,
+        " src=", pSourceSurface, " dst=", pDestinationSurface));
+    smbTraceSurface("upload-destination", static_cast<MTLD3D9Surface *>(pDestinationSurface));
+  }
   settleUploadPressure(); // ml1490, as in UpdateTexture
   if (!pSourceSurface || !pDestinationSurface)
     return D3DERR_INVALIDCALL;
@@ -4168,6 +4395,9 @@ MTLD3D9Device::UpdateTexture(IDirect3DBaseTexture9 *pSourceTexture, IDirect3DBas
     return D3DERR_INVALIDCALL;
   if (pSourceTexture == pDestinationTexture)
     return D3DERR_INVALIDCALL;
+  if (d9SmbTraceEnabled() && m_smbFrame <= 120)
+    Logger::info(str::format("[smb] UpdateTexture frame=", m_smbFrame,
+        " src=", pSourceTexture, " dst=", pDestinationTexture));
   // Identify both textures without calling through their app-visible vtables (see
   // SetTexture); read each type from its own internal common-texture vtable.
   MTLD3D9CommonTexture *src_common = commonTextureFromBound(pSourceTexture);
@@ -4210,6 +4440,11 @@ MTLD3D9Device::UpdateTexture(IDirect3DBaseTexture9 *pSourceTexture, IDirect3DBas
     // untouched: levels_to_copy caps at the source's remaining count, so the
     // wider-dst case native accepts needs no gate. Native and PRIMARY wined3d both
     // accept it; only DXVK rejects.
+    if (d9SmbTraceEnabled() && m_smbFrame <= 120)
+      Logger::info(str::format("[smb] UpdateTexture2D src=", src, " dst=", dst,
+          " dst-tex=", dst->dxmtTexture().ptr(), " fmt=", uint32_t(src->d3dFormat()),
+          " src-pool=", uint32_t(src->pool()), " dst-pool=", uint32_t(dst->pool()),
+          " dirty=", src->isDirty(), " levels=", src->levelCount(), "/", dst->levelCount()));
     const UINT src_levels = src->levelCount();
     const UINT dst_levels = dst->levelCount();
     // Mip-tail correspondence: when src has a larger base than dst, dst maps
@@ -5212,6 +5447,11 @@ MTLD3D9Device::stretchRectImpl(
     D3DTEXTUREFILTERTYPE Filter, bool from_readback
 ) {
   D9DeviceLock lock = LockDevice();
+  if (smbTraceActive()) {
+    Logger::info(str::format("[smb] StretchRect frame=", m_smbFrame, " filter=", Filter));
+    smbTraceSurface("stretch-source", static_cast<MTLD3D9Surface *>(pSourceSurface));
+    smbTraceSurface("stretch-destination", static_cast<MTLD3D9Surface *>(pDestSurface));
+  }
   // No autorelease pool needed here post-chunk-migration. The body
   // only does validation, rect parsing, and QueueBlitOp (a vector
   // push_back); every Metal-touching call moved into the chunk
@@ -6003,6 +6243,15 @@ MTLD3D9Device::SetRenderTarget(DWORD RenderTargetIndex, IDirect3DSurface9 *pRend
   // ref and AddRefPrivate's the new one. surface=nullptr is the
   // unbind path (idx>0).
   m_renderTargets[RenderTargetIndex] = surface;
+  if (smbTraceActive()) {
+    Logger::info(str::format("[smb] SetRenderTarget frame=", m_smbFrame, " slot=", RenderTargetIndex));
+    smbTraceSurface("target", surface);
+    if (surface) {
+      bool seen = false;
+      for (auto &old : m_smbTargets) seen |= old.ptr() == surface;
+      if (!seen) m_smbTargets.emplace_back(surface);
+    }
+  }
   // Flag an AUTOGENMIPMAP render target for mip regen on bind, matching
   // DXVK (SetRenderTargetInternal: IsAutomaticMip -> SetNeedsMipGen).
   // dxmt already flags on Clear/StretchRect/ColorFill but not the
@@ -6188,6 +6437,11 @@ HRESULT STDMETHODCALLTYPE
 MTLD3D9Device::Clear(DWORD Count, const D3DRECT *pRects, DWORD Flags, D3DCOLOR Color, float Z, DWORD Stencil) {
   D3D9_CENSUS(D3D9_CENSUS_MTLD3D9Device_Clear);
   D9DeviceLock lock = LockDevice();
+  if (smbTraceActive()) {
+    Logger::info(str::format("[smb] Clear frame=", m_smbFrame, " flags=", Flags,
+        " ARGB=", Color, " depth=", Z, " stencil=", Stencil, " rects=", Count));
+    smbTraceSurface("clear-target", m_renderTargets[0].ptr());
+  }
   // DXVK: Count==0 with a non-null rect array is a documented
   // no-op, not an error.
   if (Count == 0 && pRects != nullptr)
@@ -6206,8 +6460,11 @@ MTLD3D9Device::Clear(DWORD Count, const D3DRECT *pRects, DWORD Flags, D3DCOLOR C
   // dropped whole ("mismatching sizes"), returning OK.
   if (ds && (Flags & D3DCLEAR_TARGET) && (Flags & (D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL))) {
     MTLD3D9Surface *rt0 = m_renderTargets[0].ptr();
-    if (rt0 && (ds->desc().Width < rt0->desc().Width || ds->desc().Height < rt0->desc().Height))
+    if (rt0 && (ds->desc().Width < rt0->desc().Width || ds->desc().Height < rt0->desc().Height)) {
+      if (smbTraceActive())
+        Logger::info("[smb] Clear skipped: depth surface smaller than target");
       return D3D_OK;
+    }
   }
   // Drop stencil if the bound DS format has no stencil aspect; D3D9
   // silently masks; Metal would reject the encoder. DXVK does
@@ -6397,6 +6654,20 @@ MTLD3D9Device::SetViewport(const D3DVIEWPORT9 *pViewport) {
   if (!pViewport)
     return D3DERR_INVALIDCALL;
   D3DVIEWPORT9 vp = *pViewport;
+  // The runtime fails a viewport that "describes a region that cannot exist within
+  // the render target surface" (SetViewport docs), keeping the previous one. Super
+  // Meat Boy letterboxes 16:9 into a wider screen and passes a negative top edge
+  // that arrives wrapped (Y=0x7FFFFFBA): accepted, every draw lands off screen.
+  // Only an origin past the target's edge is refused; oversized extents still pass.
+  if (auto *rt = m_renderTargets[0].ptr()) {
+    const auto &d = rt->desc();
+    if (vp.X >= d.Width || vp.Y >= d.Height) {
+      if (d9SmbTraceEnabled())
+        Logger::warn(str::format("[viewport] refused origin ", vp.X, ",", vp.Y, " size ", vp.Width, "x", vp.Height,
+            " outside ", d.Width, "x", d.Height));
+      return D3DERR_INVALIDCALL;
+    }
+  }
   // DXVK normalises inverted Z (d3d9_device.cpp); Metal's
   // viewport rejects MaxZ <= MinZ at draw time.
   if (!(vp.MinZ < vp.MaxZ))
@@ -6916,6 +7187,11 @@ MTLD3D9Device::SetTexture(DWORD Stage, IDirect3DBaseTexture9 *pTexture) {
   // overlay may have wrapped, or an app deliberately corrupted): an unrecognised
   // non-null pointer is treated as "no texture", matching wined3d.
   MTLD3D9CommonTexture *common = commonTextureFromBound(pTexture);
+  if (smbTraceActive())
+    Logger::info(str::format("[smb] SetTexture frame=", m_smbFrame, " stage=", Stage, " slot=", slot,
+        " iface=", (void *)pTexture, " vtable=", pTexture ? *reinterpret_cast<const void *const *>(pTexture) : nullptr,
+        " common=", (void *)common, " tex=", common && common->dxmtTexture() ? (void *)common->dxmtTexture().ptr() : nullptr,
+        " record=", m_inStateBlockRecord));
   if (common) {
     // Cross-device check matches Set(RT|DepthStencilSurface). Same
     // reasoning: deviceRaw() avoids an AddRef/Release cycle that
@@ -7514,6 +7790,13 @@ MTLD3D9Device::BuildDrawCapture() {
 
 void
 MTLD3D9Device::QueueBatchedDraw(BatchedDraw &&draw) {
+  if (smbTraceActive()) {
+    smbTraceDraw();
+    Logger::info(str::format("[smb] primitive type=", uint32_t(draw.primitive_type),
+        " indexed=", draw.type == BatchedDraw::kIndexed, " count=", draw.vertex_or_index_count,
+        " start=", draw.start_vertex_or_index, " base=", draw.base_vertex));
+  }
+
   // Regenerate any bound AUTOGENMIPMAP texture's dirty mip chain before this
   // draw is pushed, so the mip-gen op precedes the draws that sample it in the
   // op stream (DXVK PrepareDraw shape). The hot path pays a single relaxed load
@@ -7807,6 +8090,18 @@ MTLD3D9Device::QueueBatchedDraw(BatchedDraw &&draw) {
   // pair the COW model paid per cluster boundary (~4400 ref setters/frame
   // in a heavy draw scene, clustered such that effectively every draw
   // rebuilt the snapshot under COW). wined3d CS shape.
+
+  // Capture freezes the allocation; stamp its use after pre-draw texture
+  // work, which may advance the submission sequence. The device lock keeps
+  // each buffer's current name unchanged between capture and this enqueue.
+  // Encoder-side retention alone is too late: a subsequent Lock can run
+  // before this queued draw reaches the encoding thread.
+  for (uint32_t slot = 0; slot < D3D9_MAX_VERTEX_STREAMS; ++slot) {
+    if (draw.cap.vb_slots[slot].alloc.ptr() && m_vertexBuffers[slot])
+      m_vertexBuffers[slot]->markUsed(m_currentCmdSeq);
+  }
+  if (draw.cap.ib_alloc.ptr() && m_indexBuffer)
+    m_indexBuffer->markUsed(m_currentCmdSeq);
 
   // Push to the arrival-order op stream FIRST so the index field
   // points at the slot we're about to occupy in m_pendingDraws.
@@ -8816,8 +9111,11 @@ MTLD3D9Device::PackDrawConstants(
 
   constexpr size_t kSubAlign = 256;
   auto align_up = [](size_t v, size_t a) { return (v + a - 1) & ~(a - 1); };
-  // Clamp vs/ps const_F to the app's sticky high-water mark (set in
-  // Set{Vertex,Pixel}ShaderConstantF). Typical workloads touch ~30 VS /
+  // Include every statically referenced register, even if the app never set it:
+  // unset constants are zero, not adjacent packed uniform data. Shader identity
+  // keys the upload cache because shader switches can widen this extent.
+  // The app's sticky high-water mark (set in
+  // Set{Vertex,Pixel}ShaderConstantF) also contributes. Typical workloads touch ~30 VS /
   // ~20 PS registers against the 256/224 maxes; full-extent uploads are
   // mostly memcpying zeros. DXVK's maxChangedConstF is the literal
   // reference. A relative-addressing shader instead uploads the whole
@@ -8833,8 +9131,12 @@ MTLD3D9Device::PackDrawConstants(
   // 256 and the hot path is unchanged.
   const uint32_t vs_file_size =
       pod.vs_const_F_overflow ? (D3D9_MAX_VS_CONST_F + pod.vs_const_F_overflow_count) : D3D9_MAX_VS_CONST_F;
-  uint32_t vs_f_regs = resolve_const_f_extent(pod.vs_const_f_max, vs_uses_relative, vs_file_size);
-  uint32_t ps_f_regs = resolve_const_f_extent(pod.ps_const_f_max, ps_uses_relative, D3D9_MAX_PS_CONST_F);
+  uint32_t vs_f_regs = resolve_const_f_extent(
+      std::max<uint32_t>(pod.vs_const_f_max, !ffp_vs ? vs->metadata().max_float_const_index : 0u),
+      vs_uses_relative, vs_file_size);
+  uint32_t ps_f_regs = resolve_const_f_extent(
+      std::max<uint32_t>(pod.ps_const_f_max, ps ? ps->metadata().max_float_const_index : 0u),
+      ps_uses_relative, D3D9_MAX_PS_CONST_F);
   // A generated vertex shader reads the fixed-function uniforms block
   // through this slot; size it for the full layout contract (matrix,
   // fog, point-scale and lighting blocks) rather than the register
@@ -10605,16 +10907,17 @@ MTLD3D9Device::ResolveBatchedDrawForChunk(
   // snapshot, so a shader<->fixed-function transition inside one cluster
   // would otherwise reuse the other kind's upload verbatim. A
   // relative-addressing shader also keys here: its upload differs from a
-  // plain sticky one (full-file extent, and def-stamping when it has defs),
+  // directly addressed one (full-file extent, and def-stamping when it has defs),
   // so it must not reuse a direct-addressing shader's narrower bytes for the
-  // same pod.
+  // same pod. Direct reads also depend on shader identity: a new shader can
+  // read more unset registers without any Set*Constant call changing the pod.
   static const char kFfpConstKey = 0;
   const void *vs_defs_key =
-      !ffp_vs ? (vs_uses_relative ? static_cast<const void *>(vs) : nullptr) : static_cast<const void *>(&kFfpConstKey);
+      !ffp_vs ? static_cast<const void *>(vs) : static_cast<const void *>(&kFfpConstKey);
   // The pixel side needs the same treatment now that sub-buffer[3]
   // carries the combiner constants for a generated PS.
   const void *ps_defs_key =
-      ps ? (ps_uses_relative ? static_cast<const void *>(ps) : nullptr) : static_cast<const void *>(&kFfpConstKey);
+      ps ? static_cast<const void *>(ps) : static_cast<const void *>(&kFfpConstKey);
 
   // Reuse prior draw's uploads if pod_snapshot pointer equals (implies byte-equality)
   // and the def-stamping shaders match. VS/PS constants, clip planes
@@ -10757,6 +11060,7 @@ MTLD3D9Device::FlushDrawBatch() {
           // reset was missing.
           res = D9ResolvedDraw{};
           if (!this->ResolveBatchedDrawForChunk(bd, res, chunk_seq, chunk_coherent_id, const_cache, resolve_cache)) {
+            if (d9SmbTraceEnabled()) Logger::warn("[smb] draw skipped: resolve failed");
             continue;
           }
         }
@@ -10791,6 +11095,7 @@ MTLD3D9Device::FlushDrawBatch() {
           }
           res.resolved_pso = res.resolved_pso_task->state().handle;
           if (res.resolved_pso == 0) {
+            if (d9SmbTraceEnabled()) Logger::warn("[smb] draw skipped: pipeline failed");
             continue; // link failed: skip
           }
         }
@@ -12272,6 +12577,10 @@ MTLD3D9Device::SetPixelShaderConstantF(UINT StartRegister, const float *pConstan
     return D3D_OK;
   if (!pConstantData)
     return D3DERR_INVALIDCALL;
+  if (smbTraceActive())
+    Logger::info(str::format("[smb] SetPSConstF frame=", m_smbFrame, " start=", StartRegister, " count=", Vector4fCount,
+        " first=", pConstantData[0], ",", pConstantData[1], ",", pConstantData[2], ",", pConstantData[3],
+        " record=", m_inStateBlockRecord));
   if (m_inStateBlockRecord) {
     std::memcpy(
         &m_recordingBlock->m_snapPsConstantsF[StartRegister][0], pConstantData,

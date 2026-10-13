@@ -1414,6 +1414,47 @@ d3d9shim_device_invalidate_children(struct d3d9shim_device *dev)
     table_unlock();
 }
 
+/* ml2331: a non-Ex Reset returns every binding to its default
+ * (d3d9_device.cpp resetStateToDefaults), so the shadow has to follow it.
+ * Left in place, the shadow kept answering GetTexture / GetStreamSource /
+ * GetIndices with pre-Reset objects, and its private references kept their
+ * wrappers -- and so their native handles, which are PUBLIC references on
+ * the native side -- alive.  A DEFAULT-pool resource the application had
+ * already released then still counted in the native losable gate and failed
+ * the next Reset.  Render targets and the depth stencil are re-resolved
+ * through d3d9shim_device_invalidate_children. */
+void
+d3d9shim_device_reset_bindings(struct d3d9shim_device *dev)
+{
+    unsigned int i;
+
+    if (!dev)
+        return;
+    table_lock();
+    for (i = 0; i < D3D9SHIM_MAX_TEXTURE_SLOTS; i++)
+        drop_child(&dev->textures[i]);
+    for (i = 0; i < D3D9_MAX_VERTEX_STREAMS; i++) {
+        drop_child(&dev->stream_buffers[i]);
+        dev->stream_offsets[i] = 0;
+        dev->stream_strides[i] = 0;
+    }
+    drop_child(&dev->index_buffer);
+    drop_child(&dev->vertex_declaration);
+    drop_child(&dev->vertex_shader);
+    drop_child(&dev->pixel_shader);
+    dev->in_scene = 0;
+    table_unlock();
+}
+
+/* ml2331: whether the application itself still references a bound object,
+ * as opposed to only the shadow.  Textures and buffers are never
+ * sub-resources, so their own public count is the application's. */
+int
+d3d9shim_obj_app_held(const struct d3d9shim_object *obj)
+{
+    return obj && obj->refcount > 0;
+}
+
 struct d3d9shim_device_extra *
 d3d9shim_extra(struct d3d9shim_device *dev)
 {

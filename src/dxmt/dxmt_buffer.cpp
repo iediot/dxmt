@@ -12,9 +12,11 @@ namespace dxmt {
 
 std::atomic_uint64_t global_buffer_seq = {0};
 
-BufferAllocation::BufferAllocation(WMT::Device device, const WMTBufferInfo &info, Flags<BufferAllocationFlag> flags) :
+BufferAllocation::BufferAllocation(WMT::Device device, const WMTBufferInfo &info, Flags<BufferAllocationFlag> flags,
+                                   BufferBackingAllocator backing) :
     info_(info),
-    flags_(flags) {
+    flags_(flags),
+    backing_(backing) {
   // (sub)allocate a minimum of 256B buffer so that texture can be created
   info_.length = std::max(info_.length, 256ull);
   suballocation_size_ = info_.length;
@@ -23,11 +25,22 @@ BufferAllocation::BufferAllocation(WMT::Device device, const WMTBufferInfo &info
     suballocation_count_ = DXMT_PAGE_SIZE / suballocation_size_;
     info_.length = DXMT_PAGE_SIZE;
   }
-  if (flags_.test(BufferAllocationFlag::CpuPlaced)) {
+  if (flags_.test(BufferAllocationFlag::ExternalBacking)) {
+    // iOS uses 16 KB host pages even when the PE frontend uses 4 KB pages.
+    // Round in 64 bits before narrowing so a near-4GB request cannot wrap.
+    info_.length = align(info_.length, 16384);
+    if (info_.length <= SIZE_MAX)
+      placed_buffer = backing_.allocate(size_t(info_.length), 16384);
+    info_.memory.set(placed_buffer);
+    info_.options |= WMTResourceRequireDirectMemory;
+  } else if (flags_.test(BufferAllocationFlag::CpuPlaced)) {
     placed_buffer = wsi::aligned_malloc(info_.length, DXMT_PAGE_SIZE);
     info_.memory.set(placed_buffer);
   }
-  obj_ = device.newBuffer(info_);
+  // Never turn a failed placed allocation into a Metal-owned allocation:
+  // its contents may be outside the guest address space.
+  if ((!flags_.test(BufferAllocationFlag::ExternalBacking) && !flags_.test(BufferAllocationFlag::CpuPlaced)) || placed_buffer)
+    obj_ = device.newBuffer(info_);
   g_live_bufalloc.created.fetch_add(1, std::memory_order_relaxed);   /* ml684 */
   census_bytes_ = info_.length;                            /* ml677 */
   census_storage_ = ((uint32_t)info_.options >> 4) & 3;    /* ml678 storage mode */
@@ -50,8 +63,15 @@ BufferAllocation::~BufferAllocation() {
   mem_census_sub(MEMOWN_BUFFER, census_bytes_);            /* ml677 */
   if (census_site_) buf_site_sub((uint64_t)(uintptr_t)census_site_, census_bytes_);  /* ml683 */
   mem_census_buffer_detail(census_bytes_, census_storage_, census_flags_, 0);  /* ml678 */
+  // Release views and the no-copy Metal wrapper before releasing its bytes.
+  // Allocation ref-tracking has already kept all three alive through GPU use.
+  cached_view_.clear();
+  obj_ = nullptr;
   if (placed_buffer) {
-    wsi::aligned_free(placed_buffer);
+    if (flags_.test(BufferAllocationFlag::ExternalBacking))
+      backing_.free(placed_buffer);
+    else
+      wsi::aligned_free(placed_buffer);
     placed_buffer = nullptr;
   }
 }
@@ -183,18 +203,20 @@ Buffer::allocate(Flags<BufferAllocationFlag> flags, const char *site) {
    * CpuInvisible allocation is left alone: the handler leaves memory NULL for
    * it and there is nothing for the guest to address.
    *
-   * This is the whole d3d9 vertex/index-buffer path: allocateD3D9BufferStorage
-   * and every DynamicBuffer rename ask for CpuWriteCombined, never
-   * CpuInvisible. */
+   * The d3d9 mirror path requests CpuWriteCombined. Aliased buffers use
+   * ExternalBacking below instead, with an explicit guest allocator and
+   * DefaultCache so CPU read locks remain efficient. */
   if (!flags.test(BufferAllocationFlag::CpuInvisible))
     flags.set(BufferAllocationFlag::CpuPlaced);
 #endif
-  WMTBufferInfo info;
+  if (backing_.allocate)
+    flags.set(BufferAllocationFlag::ExternalBacking);
+  WMTBufferInfo info{};
   info.memory.set(0);
   info.length = length_;
   info.options = options;
   {
-    auto *ba = new BufferAllocation(device_, info, flags);
+    auto *ba = new BufferAllocation(device_, info, flags, backing_);
     ba->census_site_ = site;                       /* ml683 */
     buf_site_add((uint64_t)(uintptr_t)site, ba->census_bytes_);
     return ba;

@@ -280,6 +280,15 @@ public:
     ptr.set(data);
     MTLBuffer_updateContents(handle, offset, ptr, length);
   }
+  void updateTextureContents(uint64_t offset, const void *data, size_t rows, size_t depth,
+                             size_t dst_row, size_t src_row, size_t src_image,
+                             size_t valid_row, size_t valid_image) {
+    WMTConstMemoryPointer ptr;
+    ptr.set(data);
+    MTLBuffer_updateTextureContents(handle, offset, ptr, rows, depth, dst_row, src_row,
+                                   src_image, valid_row, valid_image);
+  }
+
 };
 
 class SamplerState : public Object {

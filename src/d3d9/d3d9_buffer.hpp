@@ -10,23 +10,22 @@
 #include "dxmt_buffer.hpp"
 #include "dxmt_dynamic.hpp"
 
+#include <vector>
+
 namespace dxmt {
 
 class MTLD3D9Device;
 
-// IDirect3DVertexBuffer9 backed by a dxmt::DynamicBuffer recycling wrapper
-// (the same one d3d11 uses) over a CPU-writable allocation, plus a host mirror
-// the app writes and the consuming draw copies whole into that allocation.
-// A Lock therefore never waits on the GPU, and never hands out memory
-// Metal has wrapped: d3d9_buffer_map.hpp records why that is the only
-// storage offered. The refresh that carries the mirror to the device recycles a
-// GPU-idle allocation from the FIFO, or mints one. No sub-resources; standalone shape (self-pin in ctor, AddRef/Release
-// pin device). References: d3d11_buffer.cpp / d3d11_context_imm.cpp
-// (DynamicBuffer + MapDynamicBuffer), DXVK d3d9_common_buffer.cpp.
+bool allocateD3D9BufferStorage(WMT::Device device, UINT length, D3DPOOL pool,
+                              Rc<dxmt::Buffer> &buffer, void *&host, bool &watch, bool allow_alias = true);
+
+// Large drawable buffers can expose guest-owned Shared Metal storage directly.
+// DynamicBuffer recycles generations after GPU completion; smaller/unsupported
+// buffers retain the mirror + write-watch publication path.
 class MTLD3D9VertexBuffer final : public ComObject<IDirect3DVertexBuffer9> {
 public:
   MTLD3D9VertexBuffer(
-      MTLD3D9Device *device, UINT size, DWORD usage, DWORD fvf, D3DPOOL pool, void *host_ptr,
+      MTLD3D9Device *device, UINT size, DWORD usage, DWORD fvf, D3DPOOL pool, void *host_ptr, bool write_watch,
       Rc<dxmt::Buffer> dxmt_buffer
   );
   ~MTLD3D9VertexBuffer();
@@ -50,7 +49,7 @@ public:
   HRESULT STDMETHODCALLTYPE Unlock() override;
   HRESULT STDMETHODCALLTYPE GetDesc(D3DVERTEXBUFFER_DESC *pDesc) override;
 
-  // The buffer the GPU reads. A refresh renames it, so do not cache the handle.
+  // The GPU buffer. Lock or refresh may rename it; do not cache the handle.
   WMT::Buffer
   metalBuffer() const {
     return m_dynamic->immediateName()->buffer();
@@ -71,17 +70,18 @@ public:
   immediateAllocation() const {
     return m_dynamic->immediateName();
   }
-  // Whether the GPU-side cache is stale with respect to the mirror.
+  // Whether the fallback GPU cache is stale; aliases never need refresh.
   bool
   isDirty() const {
     return m_dirty;
   }
-  // Rename to a fresh allocation and copy the WHOLE mirror into it, then mark
-  // the cache current. Renaming rather than updating in place is what keeps an
-  // already-recorded draw reading the contents it was recorded with, and it is
-  // also what lets the copy be hoisted ahead of a render pass instead of
-  // splitting one.
+  // Publish observed NOOVERWRITE pages in place, or rename and copy the whole
+  // mirror when earlier draws may read changed bytes. The first refresh is
+  // always whole so untouched bytes in each watched page have a known baseline.
+  // Aliases are already visible in Shared storage, so this is a no-op.
   void refreshWholeMirror();
+  // Called when a captured draw is queued, before asynchronous encoding.
+  void markUsed(uint64_t seq) { m_lastUseSeq = seq; }
   // Raw access to the owning device: same rationale as
   // MTLD3D9Surface / MTLD3D9Texture: SetStreamSource's cross-device
   // check needs identity, not a public ref, on a hot path.
@@ -117,17 +117,23 @@ private:
   Rc<dxmt::Buffer> m_dxmtBuffer;
   // The DynamicBuffer recycling wrapper (the same one d3d11 uses,
   // d3d11_buffer.cpp). Owns the current allocation name and a FIFO of
-  // retired allocations the refresh recycles once the GPU has passed them. A refresh stores the mirror into the current
-  // name and draws read it.
+  // retired allocations recycled after GPU completion. Lock renames aliases;
+  // refresh renames mirrors. Each draw pins the name it actually captured.
   Rc<dxmt::DynamicBuffer> m_dynamic;
   // See MTLD3D9VertexBuffer::m_dirty and ::m_writeLocked.
   bool m_dirty = false;
   bool m_writeLocked = false;
-  // Nested Lock/Unlock depth; the upload fires on the outer Unlock only.
+  // Nested Lock/Unlock depth; outstanding alias pointers must stay valid.
   D3D9BufferLockCount m_lockCount;
-  // The process-owned host mirror, never registered with Metal; the dtor
-  // frees it directly. This is the pointer Lock hands the application.
+  // Current app-visible memory. Aliased storage is owned by BufferAllocation;
+  // only a fallback mirror is freed directly by this resource.
   void *m_hostPtr;
+  bool m_aliased = false;
+  uint64_t m_lastUseSeq = 0;
+  HRESULT prepareAliasLock(DWORD flags);
+  bool m_writeWatch; // Also selects VirtualFree, even if watch queries fail.
+  D3D9BufferRefreshState m_refreshState;
+  std::vector<void *> m_writtenPages; // Reused across draws; no hot-path allocation.
   UINT m_size;
   DWORD m_usage;
   DWORD m_fvf;
@@ -155,7 +161,7 @@ private:
 class MTLD3D9IndexBuffer final : public ComObject<IDirect3DIndexBuffer9> {
 public:
   MTLD3D9IndexBuffer(
-      MTLD3D9Device *device, UINT size, DWORD usage, D3DFORMAT format, D3DPOOL pool, void *host_ptr,
+      MTLD3D9Device *device, UINT size, DWORD usage, D3DFORMAT format, D3DPOOL pool, void *host_ptr, bool write_watch,
       Rc<dxmt::Buffer> dxmt_buffer
   );
   ~MTLD3D9IndexBuffer();
@@ -206,8 +212,9 @@ public:
     return m_dirty;
   }
   void refreshWholeMirror();
-  // Host-mapped pointer to the current index data: the host mirror, which is
-  // authoritative. The index fan-remap path in d3d9_device.cpp reads the
+  // Called when a captured draw is queued, before asynchronous encoding.
+  void markUsed(uint64_t seq) { m_lastUseSeq = seq; }
+  // Host pointer to the current generation (or the authoritative mirror). The index fan-remap path in d3d9_device.cpp reads the
   // source indices through it to remap them; callers must null-check.
   const void *
   hostPointer() const {
@@ -230,11 +237,17 @@ private:
   Rc<dxmt::Buffer> m_dxmtBuffer;
   Rc<dxmt::DynamicBuffer> m_dynamic;
   void *m_hostPtr;
-  // The mirror is authoritative. This says only that the GPU-side cache no
-  // longer matches it; WHICH bytes differ is deliberately not tracked, because
-  // the application does not truthfully say (d3d9_buffer_map.hpp).
+  bool m_aliased = false;
+  uint64_t m_lastUseSeq = 0;
+  HRESULT prepareAliasLock(DWORD flags);
+  bool m_writeWatch; // Also selects VirtualFree, even if watch queries fail.
+  D3D9BufferRefreshState m_refreshState;
+  std::vector<void *> m_writtenPages; // Reused across draws; no hot-path allocation.
+  // In fallback mode the mirror is authoritative. The GPU-side cache no
+  // longer matches it; write-watch tracks actual writes, not the untrusted
+  // range supplied by the application (d3d9_buffer_map.hpp).
   bool m_dirty = false;
-  // A write lock that is still outstanding. An application may hold a buffer
+  // A fallback write lock that is still outstanding. An application may hold a buffer
   // mapped across many draws and write each region just before the draw that
   // reads it, without ever re-locking, so the lock is the only announcement we
   // get and it arrives once. Clearing the dirty flag on the first refresh would

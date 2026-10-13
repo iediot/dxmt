@@ -165,6 +165,9 @@ void  d3d9shim_obj_release_private(struct d3d9shim_object *obj);
 void  d3d9shim_obj_note_call(unsigned int op, const void *block);
 /* Reset invalidates every cached implicit child identity. */
 void  d3d9shim_device_invalidate_children(struct d3d9shim_device *dev);
+/* A successful non-Ex Reset unbinds everything; the shadow follows (ml2331). */
+void  d3d9shim_device_reset_bindings(struct d3d9shim_device *dev);
+int   d3d9shim_obj_app_held(const struct d3d9shim_object *obj);
 struct d3d9shim_device_extra *d3d9shim_extra(struct d3d9shim_device *dev);
 const void *d3d9shim_kind_vtbl(unsigned int kind);
 

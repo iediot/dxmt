@@ -1,6 +1,8 @@
 #include "dxmt_dynamic.hpp"
+#include <algorithm>
 #include "dxmt_texture.hpp"
 #include "dxmt_mem_census.hpp"
+#include "log/log.hpp"
 
 namespace dxmt {
 DynamicBuffer::DynamicBuffer(Buffer *buffer, Flags<BufferAllocationFlag> flags) :
@@ -96,7 +98,28 @@ DynamicBuffer::allocate(uint64_t coherent_seq_id, bool *out_minted_fresh) {
      *
      * A blanket depth cap would be a use-after-free: an entry whose
      * will_free_at still exceeds coherent_seq_id can be in GPU use right now. */
-    enum { DYN_KEEP_ELIGIBLE = 64 };
+    // Large app-visible generations consume guest address space. Keep at most
+    // eight idle names including the current and the allocation being returned;
+    // fenced generations remain pinned until completion, never forcibly reused.
+    // Otherwise the reserve is a byte budget, not a fixed count (ml1312). A small
+    // buffer the game rewrites with DISCARD per draw needs as many generations as
+    // writes in flight: The Talos Principle peaked at 685 queued, What Remains of
+    // Edith Finch at 1,970. With a flat 64 the surplus was released the moment the
+    // GPU caught up and minted again next frame: 16.8 million Metal buffers created
+    // and destroyed in 15 minutes, ~18,000 IOGPUResourceCreate calls a second. 8 MB
+    // per instance keeps those small names (floor 64, ceiling 4096) and leaves a
+    // large buffer near the old reserve.
+    unsigned DYN_KEEP_ELIGIBLE = 64;
+    if (buffer->hasExternalBacking())
+      DYN_KEEP_ELIGIBLE = 6;
+    else if (!fifo.empty() && fifo.front().allocation.ptr()) {
+      const uint64_t entry_bytes = std::max<uint64_t>(fifo.front().allocation->census_bytes_, 256);
+      DYN_KEEP_ELIGIBLE = (unsigned)std::clamp<uint64_t>((8ull << 20) / entry_bytes, 64, 4096);
+    }
+    if (buffer->hasExternalBacking() && fifo.size() + 2 > 8 && !alias_warned_) {
+      alias_warned_ = true;
+      Logger::warn("d3d9: aliased buffer exceeded eight generations; retaining GPU-busy storage");
+    }
     if (en > DYN_KEEP_ELIGIBLE) {
       uint64_t drop = en - DYN_KEEP_ELIGIBLE, freed = 0, freed_n = 0;
       while (drop && !fifo.empty()) {

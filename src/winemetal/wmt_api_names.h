@@ -3,7 +3,7 @@
 #ifndef WMT_API_NAMES_H
 #define WMT_API_NAMES_H
 
-#define WMT_API_COUNT 151
+#define WMT_API_COUNT 152
 
 static const char *const wmt_api_names[WMT_API_COUNT] = {
     "NSObject_retain",
@@ -157,6 +157,7 @@ static const char *const wmt_api_names[WMT_API_COUNT] = {
     "thunk_DXSOGetCompiledBitcode",
     "thunk_DXSODestroyBitcode",
     "d3d9_nop",
+    "MTLBuffer_updateTextureContents",
 };
 
 #endif

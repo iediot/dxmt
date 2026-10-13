@@ -9,6 +9,9 @@
 #include "util_win32_compat.h"
 #include "config/config.hpp"   /* ml675: d3d11.mipClampBC */
 #include "d3d11_mip_clamp_policy.hpp"   /* ml2000: d3d11.mipClampAuto */
+#include "dxmt_bcn_downscale.hpp"       /* ml2100: single-level BC downscale */
+#include <vector>
+#include <algorithm>
 #include "util_env.hpp"
 #include "util_madeira_switch.hpp"
 #include "winemetal.h"
@@ -430,6 +433,115 @@ static inline bool IsBCFormatForClamp(uint32_t f) {
          (f >= 94 && f <= 99);      /* BC6H, BC7 */
 }
 
+/* ml2101: 4-byte, 8-bit-channel formats the clamp and the downscale also
+ * take: R8G8B8A8 (27-29) and B8G8R8A8 / B8G8R8X8 (87, 88, 90-93). Uncompressed
+ * sprite art is commonly stored this way, at 4 bytes a texel. */
+static inline bool IsRGBA8ForClamp(uint32_t f) {
+  return (f >= 27 && f <= 29) || f == 87 || f == 88 || (f >= 90 && f <= 93);
+}
+
+/* ---- ml2101: texture census, every format --------------------------------
+ *
+ * The BC census (d3d11_device.cpp) cannot see uncompressed textures, so a
+ * title whose memory goes to RGBA sprites or render targets showed a Metal
+ * total nobody could account for. This counts every Texture2D by DXGI format,
+ * with its logical and physical bytes, how much of it the clamp and the
+ * downscale took, and how much was ineligible, and logs the top formats by
+ * physical bytes every 512 textures. Byte counts are estimates from the
+ * descriptor (texel/block size x extents x mips x slices). */
+static inline uint64_t
+EstimateTextureBytes(uint32_t f, uint32_t w, uint32_t h, uint32_t mips, uint32_t slices) {
+  uint32_t bpb = 4, block = 1;   /* bytes per block, block edge in texels */
+  if ((f >= 70 && f <= 72) || (f >= 79 && f <= 81)) { bpb = 8; block = 4; }       /* BC1, BC4 */
+  else if (IsBCFormatForClamp(f)) { bpb = 16; block = 4; }                          /* BC2/3/5/6H/7 */
+  else if (f >= 1 && f <= 4) bpb = 16;                                              /* R32G32B32A32 */
+  else if (f >= 5 && f <= 8) bpb = 12;                                              /* R32G32B32 */
+  else if (f >= 9 && f <= 22) bpb = 8;                                              /* 64-bit */
+  else if (f >= 48 && f <= 59) bpb = 2;                                             /* R8G8, R16 */
+  else if ((f >= 60 && f <= 65) || f == 85 || f == 86 || f == 115) bpb = 1;         /* R8, A8 */
+  uint64_t total = 0;
+  for (uint32_t m = 0; m < std::max(1u, mips); m++) {
+    uint64_t bw = (std::max(1u, w >> m) + block - 1) / block, bh = (std::max(1u, h >> m) + block - 1) / block;
+    total += bw * bh * bpb;
+  }
+  return total * std::max(1u, slices);
+}
+
+struct TexCensusEntry {
+  std::atomic<uint64_t> n{0}, logical{0}, physical{0}, clamped{0}, downscaled{0};
+  /* 1 MB+ textures neither saving applied to, by why: rendered to / written by
+   * the GPU (never shrinkable), single-level without initial data, other. */
+  std::atomic<uint64_t> big_rt{0}, big_nodata{0}, big_other{0};
+};
+static TexCensusEntry g_tex_census[192];
+static std::atomic<uint64_t> g_tex_census_n{0};
+/* ml2113: the 1 MB+ "other" bytes by the reason the clamp and the downscale
+ * passed them over (bitmask, see TexSkipReason). ml2101 showed 544 MB of
+ * R8G8B8A8_SRGB in Stick It to the Stickman under "other" with no way to tell
+ * which eligibility rule excluded it. */
+static std::atomic<uint64_t> g_tex_skip_bytes[256];
+static std::atomic<uint64_t> g_tex_skip_n[256];
+
+static void
+TexCensusRecord(uint32_t f, uint64_t logical, uint64_t physical, uint32_t mip_bias, bool downscaled,
+                bool srv_only, bool single_level, bool has_data, uint32_t skip_reason = 0) {
+  if (f >= 192) f = 0;
+  auto &e = g_tex_census[f];
+  e.n.fetch_add(1, std::memory_order_relaxed);
+  e.logical.fetch_add(logical, std::memory_order_relaxed);
+  e.physical.fetch_add(physical, std::memory_order_relaxed);
+  if (mip_bias) e.clamped.fetch_add(logical - physical, std::memory_order_relaxed);
+  if (downscaled) e.downscaled.fetch_add(logical - physical, std::memory_order_relaxed);
+  /* "Big and untouched": 1 MB or more that neither saving applied to. */
+  if (!mip_bias && !downscaled && logical >= (1u << 20)) {
+    if (!srv_only) e.big_rt.fetch_add(logical, std::memory_order_relaxed);
+    else if (single_level && !has_data) e.big_nodata.fetch_add(logical, std::memory_order_relaxed);
+    else {
+      e.big_other.fetch_add(logical, std::memory_order_relaxed);
+      g_tex_skip_bytes[skip_reason & 255].fetch_add(logical, std::memory_order_relaxed);
+      g_tex_skip_n[skip_reason & 255].fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+  const uint64_t n = g_tex_census_n.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (n % 512)
+    return;
+  uint32_t order[192];
+  for (uint32_t i = 0; i < 192; i++) order[i] = i;
+  std::sort(order, order + 192, [](uint32_t a, uint32_t b) {
+    return g_tex_census[a].physical.load(std::memory_order_relaxed) > g_tex_census[b].physical.load(std::memory_order_relaxed);
+  });
+  uint64_t all = 0;
+  for (auto &c : g_tex_census) all += c.physical.load(std::memory_order_relaxed);
+  ERR("[tex-census] ml2101 after ", n, " textures: physical ", all >> 20, " MB in total; top formats:");
+  for (uint32_t i = 0; i < 8; i++) {
+    auto &c = g_tex_census[order[i]];
+    if (!c.physical.load(std::memory_order_relaxed)) break;
+    ERR("[tex-census]   fmt=", order[i], " n=", c.n.load(std::memory_order_relaxed),
+        " logical=", c.logical.load(std::memory_order_relaxed) >> 20, "MB physical=",
+        c.physical.load(std::memory_order_relaxed) >> 20, "MB clamp-saved=",
+        c.clamped.load(std::memory_order_relaxed) >> 20, "MB downscale-saved=",
+        c.downscaled.load(std::memory_order_relaxed) >> 20, "MB | big untouched: rendered-to=",
+        c.big_rt.load(std::memory_order_relaxed) >> 20, "MB no-initial-data=",
+        c.big_nodata.load(std::memory_order_relaxed) >> 20, "MB other=",
+        c.big_other.load(std::memory_order_relaxed) >> 20, "MB");
+  }
+  /* ml2113: why "other" was skipped. Bits: 1 single-level, 2 usage not
+   * DEFAULT/IMMUTABLE, 4 CPU access, 8 misc flags beyond cube/resource-clamp,
+   * 16 array, 32 odd width or height, 64 no initial data, 128 cube or under
+   * 256 px (downscale size floor). */
+  uint32_t ro[256];
+  for (uint32_t i = 0; i < 256; i++) ro[i] = i;
+  std::sort(ro, ro + 256, [](uint32_t a, uint32_t b) {
+    return g_tex_skip_bytes[a].load(std::memory_order_relaxed) > g_tex_skip_bytes[b].load(std::memory_order_relaxed);
+  });
+  for (uint32_t i = 0; i < 5; i++) {
+    const uint64_t bytes = g_tex_skip_bytes[ro[i]].load(std::memory_order_relaxed);
+    if (!bytes) break;
+    ERR("[tex-census]   other skipped by reason=0x", std::hex, ro[i], std::dec, ": ", bytes >> 20, "MB in ",
+        g_tex_skip_n[ro[i]].load(std::memory_order_relaxed), " textures (ml2113)");
+  }
+}
+
 /* ---- ml2000: memory-pressure-aware automatic clamp (d3d11.mipClampAuto) ----
  *
  * A D3D11 scene load created ~500 SRV-only BC textures (mostly 2048/4096
@@ -463,8 +575,14 @@ GetMipClampAutoConfig() {
     else if (!opt.empty() || !env_v.empty())
       c.enabled = true;
     else
-      c.enabled = kMadeira32BitModule;
-    c.threshold_mb = (uint32_t)std::max(0, Config::getInstance().getOption<int>("d3d11.mipClampAutoMB", 1536));
+      c.enabled = true;   /* ml2120: 64-bit too (was 32-bit only, see below) */
+    /* ml2120: Stick It to the Stickman (64-bit) loads 3.8 GB of large BC and
+     * RGBA8 art, nearly all of it eligible, and was killed at the iPhone's 6 GB
+     * limit with nothing clamped because the auto clamp only ran in the i386
+     * module. A 64-bit process also has more besides textures (FEX, Wine, the
+     * game's own heap), so it starts clamping a little earlier. */
+    c.threshold_mb = (uint32_t)std::max(0, Config::getInstance().getOption<int>("d3d11.mipClampAutoMB",
+                                                                            kMadeira32BitModule ? 1536 : 2048));
     if (c.enabled)
       ERR("[mip-clamp] ml2000 auto on threshold=", c.threshold_mb,
           " MB (d3d11.mipClampAuto=0 or MADEIRA_MIP_CLAMP_AUTO=0 disables; d3d11.mipClampAutoMB sets the threshold)");
@@ -492,16 +610,10 @@ static std::atomic<int64_t> g_auto_headroom_mb{mip_clamp::kHeadroomUnknown};
 static std::atomic<int64_t> g_auto_footprint_mb{0};
 static std::atomic<bool> g_auto_pressure_logged{false};
 
-/* Bias for an auto candidate already known to pass the mipClampBC filter. */
-static uint32_t
-MipClampAutoBias(uint32_t width, uint32_t height, uint32_t mip_levels) {
-  const MipClampAutoConfig &cfg = GetMipClampAutoConfig();
-  if (!cfg.enabled || !cfg.threshold_mb || !mip_clamp::AutoSizeEligible(width, height))
-    return 0;
-  const uint32_t bias = mip_clamp::ClampBias(1, width, height, mip_levels, true);
-  if (!bias)
-    return 0;
-
+/* Is the process within the auto threshold of its memory limit? Counts one
+ * auto candidate; re-reads the headroom on the ShouldRequery cadence. */
+static bool
+MipClampAutoUnderPressure(const MipClampAutoConfig &cfg) {
   const uint64_t n = g_auto_candidates.fetch_add(1, std::memory_order_relaxed) + 1;
   int64_t headroom = g_auto_headroom_mb.load(std::memory_order_relaxed);
   if (mip_clamp::ShouldRequery(n, headroom, cfg.threshold_mb)) {
@@ -522,8 +634,21 @@ MipClampAutoBias(uint32_t width, uint32_t height, uint32_t mip_levels) {
         g_auto_footprint_mb.load(std::memory_order_relaxed), " MB -> ", pressure ? "clamping" : "not clamping",
         " large BC textures (threshold ", cfg.threshold_mb, " MB) clamped=",
         g_auto_clamped.load(std::memory_order_relaxed));
-  if (!pressure)
+  return pressure;
+}
+
+/* Bias for an auto candidate already known to pass the mipClampBC filter. */
+static uint32_t
+MipClampAutoBias(uint32_t width, uint32_t height, uint32_t mip_levels) {
+  const MipClampAutoConfig &cfg = GetMipClampAutoConfig();
+  if (!cfg.enabled || !cfg.threshold_mb || !mip_clamp::AutoSizeEligible(width, height))
     return 0;
+  const uint32_t bias = mip_clamp::ClampBias(1, width, height, mip_levels, true);
+  if (!bias)
+    return 0;
+  if (!MipClampAutoUnderPressure(cfg))
+    return 0;
+  const int64_t headroom = g_auto_headroom_mb.load(std::memory_order_relaxed);
 
   const uint64_t clamped = g_auto_clamped.fetch_add(1, std::memory_order_relaxed) + 1;
   if (mip_clamp::ShouldLogClamp(clamped))
@@ -557,6 +682,9 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
    * descriptor; only `info` and the upload loop see reduced numbers. */
   uint32_t mip_bias = 0;
   typename tag::DESC1 physDesc = finalDesc;
+  bool downscaled = false;                  /* ml2100 */
+  std::vector<uint8_t> downscaled_pixels;   /* ml2100: outlives initialize() below */
+  D3D11_SUBRESOURCE_DATA downscaled_init = {};
   if constexpr (std::is_same_v<typename tag::DESC1, D3D11_TEXTURE2D_DESC1>) {
     static int cached_clamp = -1;
     if (cached_clamp < 0)
@@ -568,7 +696,7 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
      * LOGICAL mip indices, which UpdateTexture now translates through the bias,
      * dropping levels that no longer exist physically. */
     const bool eligible =
-        IsBCFormatForClamp((uint32_t)finalDesc.Format) &&
+        (IsBCFormatForClamp((uint32_t)finalDesc.Format) || IsRGBA8ForClamp((uint32_t)finalDesc.Format)) &&
         (finalDesc.Usage == D3D11_USAGE_DEFAULT || finalDesc.Usage == D3D11_USAGE_IMMUTABLE) &&
         finalDesc.BindFlags == D3D11_BIND_SHADER_RESOURCE && !finalDesc.CPUAccessFlags &&
         finalDesc.MipLevels >= 2 && finalDesc.SampleDesc.Count <= 1 &&
@@ -604,6 +732,80 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
       info.height             = physDesc.Height;
       info.mipmap_level_count = physDesc.MipLevels;
     }
+
+    /* ---- ml2100: halve single-level BC1/BC3 textures ----------------------
+     *
+     * A texture with one level has nothing for the clamp to drop, and those are
+     * often the largest ones (full-screen 2D art). Halve them instead, in the
+     * compressed domain (dxmt_bcn_downscale.hpp): a quarter of the memory, and
+     * normalised sampling is unchanged. Only with initial data -- that is the
+     * only content we can halve -- and only for textures the application can
+     * write solely through the runtime ops that the context drops for these.
+     *
+     * Applies when d3d11.downscaleBC=1; with it unset, whenever the clamp would
+     * (an explicit mipClampBC, or the auto clamp under memory pressure);
+     * d3d11.downscaleBC=0 turns it off. */
+    /* ml2101: 8 = uncompressed 8-bit RGBA/BGRA (IsRGBA8ForClamp), plain box filter. */
+    const int bc_kind = (finalDesc.Format >= 70 && finalDesc.Format <= 72) ? 1
+                      : (finalDesc.Format >= 76 && finalDesc.Format <= 78) ? 3
+                      : IsRGBA8ForClamp((uint32_t)finalDesc.Format) ? 8
+                      /* ml2113: 1-byte UNORM texels, R8_UNORM (61) and A8_UNORM (65) */
+                      : (finalDesc.Format == 61 || finalDesc.Format == 65) ? 9 : 0;
+    const bool texel_kind = bc_kind == 8 || bc_kind == 9;   /* uncompressed: any size (ml2113) */
+    if (!mip_bias && bc_kind && pInitialData && pInitialData[0].pSysMem && finalDesc.MipLevels == 1 &&
+        finalDesc.ArraySize == 1 && auto_misc_ok && !(finalDesc.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE) &&
+        (finalDesc.Usage == D3D11_USAGE_DEFAULT || finalDesc.Usage == D3D11_USAGE_IMMUTABLE) &&
+        finalDesc.BindFlags == D3D11_BIND_SHADER_RESOURCE && !finalDesc.CPUAccessFlags &&
+        finalDesc.SampleDesc.Count <= 1 && (texel_kind || (!(finalDesc.Width & 7) && !(finalDesc.Height & 7))) &&
+        /* ml2102: an explicit clamp is a request to save memory, so it also takes
+         * mid-sized textures (256+); the auto clamp keeps its 1024 cutoff. A 2D
+         * title kept 650 MB of 512-1000 px sprites out of reach of the 1024 one. */
+        (cached_clamp > 0 ? std::max(finalDesc.Width, finalDesc.Height) >= 256
+                          : mip_clamp::AutoSizeEligible(finalDesc.Width, finalDesc.Height))) {
+      static int downscale_opt = -2;
+      if (downscale_opt == -2)
+        downscale_opt = Config::getInstance().getOption<int>("d3d11.downscaleBC", -1);
+      const MipClampAutoConfig &cfg = GetMipClampAutoConfig();
+      const bool want = downscale_opt > 0 ||
+                        (downscale_opt < 0 && (cached_clamp > 0 ||
+                                               (cfg.enabled && cfg.threshold_mb && MipClampAutoUnderPressure(cfg))));
+      if (want) {
+        const bool rgba = texel_kind;
+        const uint32_t bpp = bc_kind == 9 ? 1u : 4u;
+        const uint32_t blk = bc_kind == 1 ? 8u : 16u;
+        /* Pitch of the half-size image: BC rows are rows of 4x4 blocks. */
+        /* ml2113: uncompressed texels halve to ceil(w/2) x ceil(h/2), so odd sizes qualify. */
+        const uint32_t half_w = rgba ? (finalDesc.Width + 1) / 2 : finalDesc.Width / 2;
+        const uint32_t half_h = rgba ? (finalDesc.Height + 1) / 2 : finalDesc.Height / 2;
+        const size_t dst_pitch = rgba ? (size_t)half_w * bpp : (size_t)(finalDesc.Width / 8) * blk;
+        downscaled_pixels.resize(dst_pitch * (rgba ? half_h : finalDesc.Height / 8));
+        const auto *src = (const uint8_t *)pInitialData[0].pSysMem;
+        const bool ok = rgba ? texel8_downscale_half(bpp, src, pInitialData[0].SysMemPitch, finalDesc.Width,
+                                                     finalDesc.Height, downscaled_pixels.data(), dst_pitch)
+                             : bcn_downscale_half(bc_kind, src, pInitialData[0].SysMemPitch, finalDesc.Width,
+                                                  finalDesc.Height, downscaled_pixels.data(), dst_pitch);
+        if (ok) {
+          downscaled = true;
+          downscaled_init.pSysMem = downscaled_pixels.data();
+          downscaled_init.SysMemPitch = (UINT)dst_pitch;
+          downscaled_init.SysMemSlicePitch = (UINT)downscaled_pixels.size();
+          pInitialData = &downscaled_init;
+          physDesc.Width  = half_w;
+          physDesc.Height = half_h;
+          info.width  = physDesc.Width;
+          info.height = physDesc.Height;
+          static std::atomic<uint64_t> downscale_n{0};
+          static std::atomic<uint64_t> downscale_saved_kb{0};
+          const uint64_t n = downscale_n.fetch_add(1, std::memory_order_relaxed) + 1;
+          const uint64_t saved =
+              downscale_saved_kb.fetch_add(downscaled_pixels.size() * 3 / 1024, std::memory_order_relaxed) +
+              downscaled_pixels.size() * 3 / 1024;
+          if (mip_clamp::ShouldLogClamp(n))
+            ERR("[bc-downscale] ml2100 #", n, rgba ? (bpp == 1 ? " R8 " : " RGBA8 ") : (bc_kind == 1 ? " BC1 " : " BC3 "), finalDesc.Width, "x", finalDesc.Height,
+                " -> ", physDesc.Width, "x", physDesc.Height, " saved ", saved / 1024, " MB in total");
+        }
+      }
+    }
   }
   bool single_subresource = info.mipmap_level_count == 1 && info.array_length == 1 &&
                             !(physDesc.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE);
@@ -611,6 +813,25 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
   /* ml745: the immediate context resolves streamed uploads through the dxmt
    * Texture, not the D3D wrapper, so the bias must be visible there too. */
   texture->setMipBias(mip_bias);
+  texture->setDownscaled(downscaled);
+  if constexpr (std::is_same_v<typename tag::DESC1, D3D11_TEXTURE2D_DESC1>) {
+    TexCensusRecord((uint32_t)finalDesc.Format,
+                    EstimateTextureBytes((uint32_t)finalDesc.Format, finalDesc.Width, finalDesc.Height,
+                                         finalDesc.MipLevels, finalDesc.ArraySize),
+                    EstimateTextureBytes((uint32_t)finalDesc.Format, physDesc.Width, physDesc.Height,
+                                         physDesc.MipLevels, physDesc.ArraySize),
+                    mip_bias, downscaled, finalDesc.BindFlags == D3D11_BIND_SHADER_RESOURCE,
+                    finalDesc.MipLevels == 1, pInitialData != nullptr,
+                    (finalDesc.MipLevels == 1 ? 1u : 0u) |
+                    ((finalDesc.Usage != D3D11_USAGE_DEFAULT && finalDesc.Usage != D3D11_USAGE_IMMUTABLE) ? 2u : 0u) |
+                    (finalDesc.CPUAccessFlags ? 4u : 0u) |
+                    ((finalDesc.MiscFlags & ~(UINT)(D3D11_RESOURCE_MISC_TEXTURECUBE | D3D11_RESOURCE_MISC_RESOURCE_CLAMP)) ? 8u : 0u) |
+                    (finalDesc.ArraySize > 1 ? 16u : 0u) |
+                    (((finalDesc.Width | finalDesc.Height) & 1) ? 32u : 0u) |
+                    (pInitialData == nullptr ? 64u : 0u) |
+                    (((finalDesc.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE) ||
+                      std::max(finalDesc.Width, finalDesc.Height) < 256) ? 128u : 0u));
+  }
 
   auto &initializer = pDevice->GetDXMTDevice().queue().initializer;
 

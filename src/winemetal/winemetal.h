@@ -109,6 +109,8 @@ WINEMETAL_API uint64_t MTLSharedEvent_signaledValue(obj_handle_t event);
 WINEMETAL_API void MTLCommandBuffer_encodeSignalEvent(obj_handle_t cmdbuf, obj_handle_t event, uint64_t value);
 
 enum WMTResourceOptions : uint64_t {
+  // winemetal-only newBuffer requirement; stripped before calling Metal.
+  WMTResourceRequireDirectMemory = 1ull << 30,
   WMTResourceCPUCacheModeDefaultCache = 0,
   WMTResourceCPUCacheModeWriteCombined = 1,
   WMTResourceStorageModeShared = 0,
@@ -1861,6 +1863,12 @@ WINEMETAL_API obj_handle_t MTLDevice_newEvent(obj_handle_t device);
 
 WINEMETAL_API void
 MTLBuffer_updateContents(obj_handle_t buffer, uint64_t offset, struct WMTConstMemoryPointer data, uint64_t length);
+
+// Appended Unix-call slot 151. Existing dispatch indices are unchanged.
+WINEMETAL_API void
+MTLBuffer_updateTextureContents(obj_handle_t buffer, uint64_t offset, struct WMTConstMemoryPointer data,
+                               uint64_t rows, uint64_t depth, uint64_t dst_row, uint64_t src_row,
+                               uint64_t src_image, uint64_t valid_row, uint64_t valid_image);
 
 WINEMETAL_API obj_handle_t SharedEventListener_create();
 

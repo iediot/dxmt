@@ -6,8 +6,9 @@
  *
  * Every pointer D3D9 hands back through Lock / LockRect / LockBox, and every
  * CPU mirror the application can reach, must live inside the guest window
- * [B, B+4G) -- a 32-bit application cannot name anything else, and
- * d3d9_buffer_map.hpp:13-54 states why the mirror can never be Metal memory.
+ * [B, B+4G) -- a 32-bit application cannot name anything else. Large VB/IB
+ * generations can wrap these guest allocations in no-copy Metal buffers;
+ * see d3d9_buffer_map.hpp for the fallback and platform caveat.
  * Natively wsi::aligned_malloc returns host heap, which is above 4 GB, so the
  * app-visible sites allocate from the guest arena instead: the shim
  * VirtualAllocs 64 MB chunks (the window chokepoint puts them in range by
@@ -37,6 +38,9 @@
 #pragma once
 
 #include <cstddef>
+#if defined(_WIN32) && !defined(DXMT_MADEIRA)
+#include <windows.h>
+#endif
 
 #include "wsi_platform.hpp"
 
@@ -87,5 +91,32 @@ guest_page_size() {
 }
 
 #endif
+
+// Write-watch needs its own VirtualAlloc reservation, not a suballocation of
+// the guest arena or aligned heap. In a PE frontend VirtualAlloc goes through
+// the same guest-window chokepoint as the heap, including on i386. The native
+// Madeira frontend has no Windows VM API; keep its existing arena path.
+inline void *
+guest_alloc_watch(size_t size, size_t alignment, bool &watched) {
+  watched = false;
+#if defined(_WIN32) && !defined(DXMT_MADEIRA)
+  if (void *ptr = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)) {
+    watched = true;
+    return ptr;
+  }
+#endif
+  return guest_alloc(size, alignment);
+}
+
+inline void
+guest_free_watch(void *ptr, bool watched) {
+#if defined(_WIN32) && !defined(DXMT_MADEIRA)
+  if (watched) {
+    VirtualFree(ptr, 0, MEM_RELEASE);
+    return;
+  }
+#endif
+  guest_free(ptr);
+}
 
 } // namespace dxmt

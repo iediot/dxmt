@@ -116,7 +116,7 @@ private:
     return false;
   }
 
-  WMT::Buffer allocateGpuHeap(size_t size, size_t &offset);
+  WMT::Buffer allocateGpuHeap(size_t size, size_t &offset, void **cpu_address = nullptr);
 
   WMT::Buffer allocateZeroBuffer(size_t size);
 
@@ -126,6 +126,8 @@ private:
   uint64_t cached_coherent_seq_id = 0;
   size_t upload_bytes_since_flush_ = 0; /* ml1243 */
   WMT::Device device_;
+  bool supports_bc_ = false;
+  bool direct_uploads_ = false;   /* DXMT_DIRECT_TEXTURE_UPLOAD=1 (dre4moff r30) */
   WMT::Reference<WMT::CommandQueue> upload_queue_;
   WMT::Reference<WMT::SharedEvent> upload_queue_event_;
   WMT::Reference<WMT::Buffer> zero_buffer_;

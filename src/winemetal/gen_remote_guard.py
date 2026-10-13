@@ -54,7 +54,7 @@ ROUTED = {
     '_MTLDevice_newRenderPipelineState', '_MTLDevice_newComputePipelineState',
     '_MTLDevice_newDepthStencilState', '_MTLDevice_newSamplerState',
     # resources and sync
-    '_MTLDevice_newBuffer', '_MTLBuffer_updateContents', '_MTLDevice_newSharedEvent',
+    '_MTLDevice_newBuffer', '_MTLBuffer_updateContents', '_MTLBuffer_updateTextureContents', '_MTLDevice_newSharedEvent',
     # presentation seam: the HWND stays guest-local, the host layer crosses
     '_CreateMetalViewFromHWND', '_ReleaseMetalView',
     '_MetalLayer_nextDrawable', '_MetalDrawable_texture',

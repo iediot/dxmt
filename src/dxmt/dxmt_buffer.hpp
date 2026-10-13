@@ -21,12 +21,20 @@ enum class BufferAllocationFlag : uint32_t {
   /* will allocate at least one page of memory and try to suballocate from that */
   SuballocateFromOnePage = 5,
   CpuPlaced = 6,
+  ExternalBacking = 7,
 };
 
 typedef unsigned BufferViewKey;
 
 struct BufferViewDescriptor {
   WMTPixelFormat format;
+};
+
+// The allocation, not the frontend resource, owns this storage. Draw pins
+// can therefore outlive a rename or destruction of the resource wrapper.
+struct BufferBackingAllocator {
+  void *(*allocate)(size_t, size_t) = nullptr;
+  void (*free)(void *) = nullptr;
 };
 
 class Buffer;
@@ -116,7 +124,7 @@ public:
   EncoderDepKey depkey;
 
 private:
-  BufferAllocation(WMT::Device device, const WMTBufferInfo &info, Flags<BufferAllocationFlag> flags);
+  BufferAllocation(WMT::Device device, const WMTBufferInfo &info, Flags<BufferAllocationFlag> flags, BufferBackingAllocator backing);
   ~BufferAllocation();
 
   BufferAllocation(const BufferAllocation &) = delete;
@@ -134,6 +142,7 @@ private:
   uint32_t suballocation_count_ = 1;
 
   void * placed_buffer = nullptr;
+  BufferBackingAllocator backing_;
 };
 
 class Buffer {
@@ -156,7 +165,13 @@ public:
 
   Rc<BufferAllocation> rename(Rc<BufferAllocation> &&newAllocation);
 
-  Buffer(uint64_t length, WMT::Device device) : length_(length), device_(device) {}
+  Buffer(uint64_t length, WMT::Device device, BufferBackingAllocator backing = {}) :
+      length_(length), device_(device), backing_(backing) {}
+
+  bool
+  hasExternalBacking() const {
+    return backing_.allocate != nullptr;
+  }
 
   WMT::Texture view(BufferViewKey key);
   WMT::Texture view(BufferViewKey key, BufferAllocation *allocation);
@@ -188,6 +203,7 @@ private:
   std::vector<BufferViewDescriptor> viewDescriptors_;
   dxmt::mutex mutex_;
   WMT::Device device_;
+  BufferBackingAllocator backing_;
 };
 
 struct BufferSlice {

@@ -27,6 +27,7 @@ since it is for internal use only
 #include "dxmt_staging.hpp"
 #include "d3d11_resource.hpp"
 #include "dxmt_texture.hpp"
+#include "dxmt_texture_upload.hpp"
 #include "util_flags.hpp"
 #include "util_math.hpp"
 #include "util_win32_compat.h"
@@ -609,6 +610,15 @@ inline std::atomic<uint32_t> g_bc_stream_fail{0};
  * clamp is enabled means no clamped texture was ever streamed to. */
 inline std::atomic<uint32_t> g_bc_clamp_xlated{0};
 inline std::atomic<uint32_t> g_bc_clamp_dropped{0};
+/* ml2100: runtime writes and copies that touch a downscaled texture are
+ * dropped (their regions are in logical texels). Logged on the 1st, then every
+ * 64th, so a title that does stream into one is visible in the log. */
+inline std::atomic<uint32_t> g_downscale_dropped{0};
+inline void NoteDownscaledOpDropped(const char *what) {
+  const uint32_t n = g_downscale_dropped.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (n == 1 || n % 64 == 0)
+    ERR("[bc-downscale] ml2100 dropped ", what, " on a downscaled texture (", n, " so far)");
+}
 /* ml746: COPY-PATH clamp accounting. CopySubresourceRegion never translated mip
  * indices, so every copy touching a clamped texture landed on the wrong level --
  * invisible in the menu (0 copies) and severe in gameplay (1,860). Classified by
@@ -635,6 +645,20 @@ inline void BCStreamReport() {
                                         "?","?","?","?","?","?","BC4s","BC5s"};
   uint32_t total = 0;
   for (int i = 0; i < 16; i++) total += g_bc_stream_ok[i].load(std::memory_order_relaxed);
+  // Print only when something moved since the last line: unchanged it repeated
+  // ~44 times a second in The Talos Principle (41,464 identical zero lines), each
+  // a log write on the game's own thread.
+  {
+    static uint64_t last_sig = ~0ull;
+    const uint64_t sig = (uint64_t)total * 1000003ull ^ g_bc_stream_fail.load() * 7919ull ^
+                         g_bc_clamp_xlated.load() * 104729ull ^ g_bc_clamp_dropped.load() * 31ull ^
+                         g_cp_xlated.load() * 131ull ^ g_cp_dropped.load() * 137ull ^ g_cp_lost.load() * 139ull ^
+                         g_cp_refilled.load() * 149ull ^ g_cp_bc_stg_unsupported.load() * 151ull ^
+                         g_cp_bc_stg_decoded.load() * 157ull ^ g_cp_bc_stg_fail.load() * 163ull;
+    if (sig == last_sig)
+      return;
+    last_sig = sig;
+  }
   ERR("[bc-stream] ml744 decoded total=", total,
       " BC1=", g_bc_stream_ok[1].load(), " BC2=", g_bc_stream_ok[2].load(),
       " BC3=", g_bc_stream_ok[3].load(), " BC4u=", g_bc_stream_ok[4].load(),
@@ -3147,7 +3171,8 @@ public:
 
   template <typename T> moveonly_list<T> AllocateCommandData(size_t n = 1);
 
-  std::tuple<WMT::Buffer, uint64_t> AllocateStagingBuffer(size_t size, size_t alignment);
+  std::tuple<WMT::Buffer, uint64_t> AllocateStagingBuffer(size_t size, size_t alignment,
+                                                       void **cpu_address = nullptr);
   void UseCopyDestination(Rc<StagingResource> &);
   void UseCopySource(Rc<StagingResource> &);
 
@@ -3779,6 +3804,13 @@ public:
      * so they take bias 0, which is what we want. Drop only when a requested
      * logical level sits below its own texture's bias -- it does not exist. */
     {
+      {
+        auto ts = GetTexture(cmd.pSrc), td = GetTexture(cmd.pDst);
+        if ((ts && ts->downscaled()) || (td && td->downscaled())) {   /* ml2100 */
+          NoteDownscaledOpDropped("copy");
+          return;
+        }
+      }
       uint32_t src_bias = 0, dst_bias = 0;
       if (auto t = GetTexture(cmd.pSrc)) src_bias = t->mipBias();
       if (auto t = GetTexture(cmd.pDst)) dst_bias = t->mipBias();
@@ -4302,6 +4334,13 @@ public:
        *
        * Without this every streamed update would land on the wrong mip, which is
        * worse than not clamping at all. */
+      /* ml2100: a downscaled texture is half the logical size, so a region in
+       * logical texels does not fit it. Its contents came from the initial
+       * data; keep them. */
+      if (dst->downscaled()) {
+        NoteDownscaledOpDropped("UpdateSubresource");
+        return;
+      }
       const uint32_t mip_bias = dst->mipBias();
       if (mip_bias) {
         if (cmd.Dst.MipLevel < mip_bias) {
@@ -4413,9 +4452,23 @@ public:
         cmd.EffectiveRows = cmd.DstSize.height;
         g_bc_stream_ok[bc_kind & 15].fetch_add(1, std::memory_order_relaxed);
       }
-      auto bytes_per_depth_slice = cmd.EffectiveRows * cmd.EffectiveBytesPerRow;
-      auto [staging_buffer, offset] = AllocateStagingBuffer(bytes_per_depth_slice * cmd.DstSize.depth, 16);
-      if (cmd.EffectiveBytesPerRow == SrcRowPitch) {
+      const size_t bytes_per_depth_slice = size_t(cmd.EffectiveRows) * cmd.EffectiveBytesPerRow;
+      void *cpu_address = nullptr;
+      auto [staging_buffer, offset] = AllocateStagingBuffer(
+          bytes_per_depth_slice * cmd.DstSize.depth, 16, &cpu_address);
+#ifdef DXMT_IOS
+      static const bool direct_uploads = env::getEnvVar("DXMT_DIRECT_TEXTURE_UPLOAD") == "1";
+#else
+      constexpr bool direct_uploads = false;
+#endif
+      // The ring supplies a fresh suballocation; its existing GPU/command-list
+      // fences retain the backing. Remote handles never expose cpu_address.
+      if (direct_uploads && cpu_address) {
+        staging_buffer.updateTextureContents(offset, pSrcData,
+                          cmd.EffectiveRows, cmd.DstSize.depth,
+                          cmd.EffectiveBytesPerRow, SrcRowPitch, SrcDepthPitch,
+                          cmd.EffectiveBytesPerRow, bytes_per_depth_slice);
+      } else if (cmd.EffectiveBytesPerRow == SrcRowPitch) {
         for (unsigned depthSlice = 0; depthSlice < cmd.DstSize.depth; depthSlice++) {
           auto dst_offset = offset + depthSlice * bytes_per_depth_slice;
           const char *src = ((const char *)pSrcData) + depthSlice * SrcDepthPitch;
@@ -4496,6 +4549,13 @@ public:
        *
        * Without this every streamed update would land on the wrong mip, which is
        * worse than not clamping at all. */
+      /* ml2100: a downscaled texture is half the logical size, so a region in
+       * logical texels does not fit it. Its contents came from the initial
+       * data; keep them. */
+      if (dst->downscaled()) {
+        NoteDownscaledOpDropped("UpdateSubresource");
+        return;
+      }
       const uint32_t mip_bias = dst->mipBias();
       if (mip_bias) {
         if (cmd.Dst.MipLevel < mip_bias) {
@@ -4539,7 +4599,40 @@ public:
   - flush/present
   Return value indicates if a commit happens
   */
-  bool
+  /* DXMT_D11_PASS_STATS=1: which call sites end render passes. Edith Finch ran 83-97
+   * Metal render passes a frame (GPU 20-42 ms); each break stores the targets and the
+   * next pass loads them again, which is what tile GPUs pay for. Every 4096 ends the
+   * top callers are logged as offsets in this DLL (map them with llvm-addr2line on the
+   * unstripped build). */
+  __attribute__((noinline)) void
+  NotePassEnd(void *caller) {
+    static const bool on = [] { const auto v = env::getEnvVar("DXMT_D11_PASS_STATS"); return !v.empty() && v != "0"; }();
+    if (!on)
+      return;
+    static uintptr_t base = [] {
+      HMODULE module = nullptr;
+      GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                         (LPCSTR)&env::getEnvVar, &module);
+      return (uintptr_t)module;
+    }();
+    static std::mutex lock;
+    static std::unordered_map<uintptr_t, uint64_t> counts;
+    static uint64_t total;
+    std::lock_guard<std::mutex> g(lock);
+    counts[(uintptr_t)caller - base]++;
+    if (++total % 4096)
+      return;
+    std::vector<std::pair<uint64_t, uintptr_t>> top;
+    for (auto &[rva, n] : counts)
+      top.emplace_back(n, rva);
+    std::sort(top.rbegin(), top.rend());
+    std::string line = str::format("[pass-end] ", total, " render passes ended; top callers (rva:count):");
+    for (size_t i = 0; i < top.size() && i < 8; i++)
+      line += str::format(" 0x", std::hex, top[i].second, std::dec, ":", top[i].first);
+    WARN(line);
+  }
+
+  __attribute__((noinline)) bool
   InvalidateCurrentPass(bool defer_commit = false) {
     switch (cmdbuf_state) {
     case CommandBufferState::Idle:
@@ -4548,6 +4641,7 @@ public:
     case CommandBufferState::RenderPipelineReady:
     case CommandBufferState::TessellationRenderPipelineReady:
     case CommandBufferState::GeometryRenderPipelineReady: {
+      NotePassEnd(__builtin_return_address(0));
       // EmitCommand([](CommandChunk::context &ctx) {
       //   ctx.render_encoder->endEncoding();
       //   ctx.render_encoder = nullptr;
@@ -5769,8 +5863,9 @@ public:
   }
 
   std::tuple<WMT::Buffer, uint64_t>
-  AllocateStagingBuffer(size_t size, size_t alignment) {
+  AllocateStagingBuffer(size_t size, size_t alignment, void **cpu_address = nullptr) {
     auto [block, offset] = staging_allocator.allocate(1, 0, size, alignment);
+    if (cpu_address) *cpu_address = block.cpu_address;
     return {block.buffer, offset};
   }
 

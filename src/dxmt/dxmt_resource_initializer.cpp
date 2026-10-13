@@ -1,6 +1,7 @@
 #include <memory>
 #include "Metal.hpp"
 #include "dxmt_resource_initializer.hpp"
+#include "dxmt_texture_upload.hpp"
 #include "dxmt_format.hpp"
 #include "util_math.hpp"
 #include <cstdint>
@@ -51,6 +52,12 @@ ResourceInitializer::ResourceInitializer(WMT::Device device) :
     gpu_command_heap_allocator(StagingBufferBlockAllocator(
         device, WMTResourceStorageModeManaged | WMTResourceHazardTrackingModeUntracked, false, MEMOWN_INIT_UPLOAD
     )) {
+  supports_bc_ = device.supportsBCTextureCompression();
+#ifdef DXMT_IOS
+  direct_uploads_ = env::getEnvVar("DXMT_DIRECT_TEXTURE_UPLOAD") == "1";
+  Logger::info(str::format("[texture-stream] staging-block=", kResourceInitializerGpuUploadHeapSize,
+               " native-copy=", direct_uploads_, " init-batch-limit=0"));
+#endif
   upload_queue_ = device.newCommandQueue(kResourceInitializerChunks);
   upload_queue_event_ = device.newSharedEvent();
 
@@ -605,7 +612,22 @@ ResourceInitializer::initWithData(
   do {
     RETAIN(allocation);
     ALLOC_BLIT(wmtcmd_blit_copy_from_buffer_to_texture, copy);
-    ALLOC_GPU(temp, total_bytes_needed);
+    WMT::Buffer temp;
+    size_t temp_offset;
+    void *cpu_address = nullptr;
+    if (!(temp = allocateGpuHeap(total_bytes_needed, temp_offset, &cpu_address))) {
+      flushInternal(); continue;
+    }
+    if (direct_uploads_ && cpu_address) {
+#if defined(DXMT_IOS) && !defined(DXMT_MADEIRA)
+      temp.updateTextureContents(temp_offset, data,
+#else
+      copyTextureUpload(static_cast<char *>(cpu_address) + temp_offset, data,
+#endif
+                        align(height_sub, block_size) / block_size, depth_sub,
+                        bytes_per_row_needed, bytes_per_row_increment, bytes_per_image_increment,
+                        bytes_per_row_valid, bytes_per_image_valid);
+    } else {
 
     for (auto depth = 0u; depth < depth_sub; depth++) {
       if (bytes_per_row_increment != bytes_per_row_needed) {
@@ -621,6 +643,7 @@ ResourceInitializer::initWithData(
         auto src_data = ptr_add(data, depth * bytes_per_image_increment);
         temp.updateContents(offset, src_data, length);
       }
+    }
     }
 
     copy->type = WMTBlitCommandCopyFromBufferToTexture;
@@ -704,12 +727,13 @@ ResourceInitializer::encode(WMT::CommandBuffer cmdbuf) {
 }
 
 WMT::Buffer
-ResourceInitializer::allocateGpuHeap(size_t size, size_t &offset) {
+ResourceInitializer::allocateGpuHeap(size_t size, size_t &offset, void **cpu_address) {
   auto [block, offset_] = gpu_command_heap_allocator.allocate(
       current_seq_id_, cached_coherent_seq_id, size, kResourceInitializerGpuUploadHeapAlignment
   );
   upload_bytes_since_flush_ += size;
   offset = offset_;
+  if (cpu_address) *cpu_address = block.cpu_address;
   return block.buffer;
 }
 

@@ -206,6 +206,13 @@ public:
     return viewDescriptors_[view].firstMiplevel;
   }
 
+  /* ml2100: the physical texture is the logical one at half width and height
+   * (a single-level BC texture halved in the compressed domain, see
+   * dxmt_bcn_downscale.hpp). Its contents came from the initial data; runtime
+   * writes and copies, whose regions are in logical texels, are dropped. */
+  bool downscaled() const { return downscaled_; }
+  void setDownscaled(bool d) { downscaled_ = d; }
+
   WMTTextureType
   textureType(TextureViewKey view) {
     std::shared_lock<dxmt::shared_mutex> lock(mutex_);
@@ -311,6 +318,7 @@ private:
   uint32_t mip_bias_ = 0;          /* ml745, see mipBias() */
   std::atomic<uint32_t> lost_levels_{0}; /* ml1252, see lostLevels() */
   std::atomic<uint32_t> level_gen_[16] = {}; /* ml1256, see levelGen() */
+  bool downscaled_ = false;        /* ml2100, see downscaled() */
   unsigned bytes_per_image_ = 0;
   unsigned bytes_per_row_ = 0;
 

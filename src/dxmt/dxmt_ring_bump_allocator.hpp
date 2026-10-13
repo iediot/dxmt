@@ -204,6 +204,10 @@ public:
     WMT::Reference<WMT::Buffer> buffer;
     uint64_t gpu_address;
     void *mapped_address;
+    /* ported from dre4moff/Madeira (r29/r30 texture uploads): the block's local CPU
+     * view for direct texture copies. Non-owning; null for remote handles, which
+     * need explicit updateContents delivery. */
+    void *cpu_address = nullptr;
 
     ~Block() {
       mem_census_sub(census_owner, census_bytes);          /* ml677 */
@@ -234,6 +238,8 @@ public:
       buffer = std::move(move.buffer);
       gpu_address = move.gpu_address;
       mapped_address = move.mapped_address;
+      cpu_address = move.cpu_address;
+      move.cpu_address = nullptr;
       census_bytes = move.census_bytes;                    /* ml677: move the debt too */
       census_owner = move.census_owner;
       move.census_bytes = 0;
@@ -273,6 +279,11 @@ public:
     info.memory.set(block.mapped_address);
     info.length = block_size;
     block.buffer = device_.newBuffer(info);
+#ifdef DXMT_IOS
+    // Remote handles require explicit updateContents delivery. Never bypass it.
+    if (block.buffer && !(block.buffer.handle & (1ull << 63)))
+      block.cpu_address = info.memory.ptr;
+#endif
     block.gpu_address = info.gpu_address;
     block.census_bytes = block_size;                       /* ml677 */
     block.census_owner = census_owner_;

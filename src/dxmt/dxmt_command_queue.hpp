@@ -374,8 +374,9 @@ public:
   bool WaitCPUFenceBounded(uint64_t seq, uint64_t timeout_ns);
 
   std::tuple<WMT::Buffer, uint64_t>
-  AllocateStagingBuffer(size_t size, size_t alignment) {
+  AllocateStagingBuffer(size_t size, size_t alignment, void **cpu_address = nullptr) {
     auto [block, offset] = staging_allocator.allocate(ready_for_encode, cpu_coherent.signaledValue(), size, alignment);
+    if (cpu_address) *cpu_address = block.cpu_address;
     return {block.buffer, offset};
   }
 

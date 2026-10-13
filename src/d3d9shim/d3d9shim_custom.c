@@ -208,6 +208,35 @@ custom_reset(IDirect3DDevice9Ex *iface, D3DPRESENT_PARAMETERS *parameters,
         return hr;
     }
 
+    /* ml2331: the native losable gate counts PUBLIC references, and every
+     * native handle the shim holds is one.  The identity caches (back
+     * buffers, render targets, depth stencil) were dropped only AFTER a
+     * successful Reset, so once an application had asked for its back buffer
+     * or depth stencil and released it, the cached wrapper still held the
+     * implicit surface publicly and every non-Ex Reset failed INVALIDCALL
+     * from then on -- the native frontend stopped drawing after an in-game
+     * resolution change (Borderlands: The Pre-Sequel, 46 Resets, no Present).
+     * Those caches re-resolve on demand and keep identity for a wrapper the
+     * application still holds, so dropping them here is invisible.
+     *
+     * Bindings do not re-resolve, so a non-Ex device unbinds only what the
+     * application no longer references: it lost the right to observe those
+     * through Get* when it released them, and a Reset that succeeds unbinds
+     * them anyway.  Ex devices have no gate and keep their state. */
+    d3d9shim_device_invalidate_children(dev);
+    if (!(D3D9SHIM_IMPL(&dev->hdr)->flags & D3D9SHIM_F_IS_EX)) {
+        unsigned int i;
+
+        for (i = 0; i < D3D9SHIM_MAX_TEXTURE_SLOTS; i++)
+            if (dev->textures[i] && !d3d9shim_obj_app_held(dev->textures[i]))
+                IDirect3DDevice9Ex_SetTexture(iface, i < 16 ? i : D3DVERTEXTEXTURESAMPLER0 + (i - 16), NULL);
+        for (i = 0; i < D3D9_MAX_VERTEX_STREAMS; i++)
+            if (dev->stream_buffers[i] && !d3d9shim_obj_app_held(dev->stream_buffers[i]))
+                IDirect3DDevice9Ex_SetStreamSource(iface, i, NULL, 0, 0);
+        if (dev->index_buffer && !d3d9shim_obj_app_held(dev->index_buffer))
+            IDirect3DDevice9Ex_SetIndices(iface, NULL);
+    }
+
     device_window = parameters->hDeviceWindow;
     if (!device_window && extra)
         device_window = extra->focus_window;
@@ -247,6 +276,8 @@ custom_reset(IDirect3DDevice9Ex *iface, D3DPRESENT_PARAMETERS *parameters,
          * buffers, so every cached child identity is stale: drop them and let
          * the next GetBackBuffer / GetSwapChain resolve fresh handles. */
         d3d9shim_device_invalidate_children(dev);
+        if (!(D3D9SHIM_IMPL(&dev->hdr)->flags & D3D9SHIM_F_IS_EX))
+            d3d9shim_device_reset_bindings(dev);
         d3d9shim_window_on_device_reset(dev, parameters);
     }
     d3d9shim_unlock(dev);

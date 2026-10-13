@@ -13,6 +13,12 @@ d9EnvGateEnabled(const char *name) {
   return value == "1" || value == "true" || value == "yes" || value == "on";
 }
 
+inline bool
+d9SmbTraceEnabled() {
+  static const bool on = d9EnvGateEnabled("DXMT_D9_TRACE_SMB");
+  return on;
+}
+
 // One-shot diagnostics a normal run should never emit, such as the
 // device-teardown high-water reports.
 inline bool

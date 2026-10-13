@@ -690,6 +690,17 @@ madeira_cpu_cache_mode(MTLResourceOptions options) {
 static NTSTATUS
 _MTLDevice_newBuffer(void *obj) {
   struct unixcall_mtldevice_newbuffer *params = obj;
+  struct WMTBufferInfo *direct_info = params->info.ptr;
+  if (direct_info->options & WMTResourceRequireDirectMemory) {
+    direct_info->options &= ~WMTResourceRequireDirectMemory;
+    // A remote shadow is not an alias: accepting it would silently restore
+    // diffing/copies and invalidate the frontend's direct-mapping contract.
+    if (wmtr_enabled() || !direct_info->memory.ptr) {
+      params->ret = 0;
+      direct_info->gpu_address = 0;
+      return STATUS_SUCCESS;
+    }
+  }
   if (wmtr_enabled()) {
     struct WMTBufferInfo *bi = params->info.ptr;
     uint8_t buf[sizeof(struct rm_wmt_info) + sizeof(struct WMTBufferInfo)];
@@ -5393,6 +5404,45 @@ _MTLBuffer_updateContents(void *obj) {
   return STATUS_SUCCESS;
 }
 
+#include "texture_upload_copy.h"
+
+static NTSTATUS
+_MTLBuffer_updateTextureContents(void *obj) {
+  const struct unixcall_mtlbuffer_updatetexturecontents *p = (const struct unixcall_mtlbuffer_updatetexturecontents *)obj;
+  size_t size;
+  if (!wmt_texture_upload_size(p->rows, p->depth, p->dst_row, p->src_row,
+                               p->src_image, p->valid_row, p->valid_image, &size) ||
+      p->offset > SIZE_MAX - size || !p->data.ptr)
+    return STATUS_INVALID_PARAMETER;
+  if (wmtr_enabled()) {
+    /* Remote handles must never be sent to ObjC. Keep the established explicit
+     * upload/snapshot ordering, even if a future caller uses this slot remotely. */
+    for (size_t z = 0; z < p->depth; ++z) {
+      const size_t count = p->src_row == p->dst_row ? 1 : p->rows;
+      for (size_t y = 0; y < count; ++y) {
+        struct unixcall_mtlbuffer_updatecontents row = {
+            p->buffer, p->offset + z * p->rows * p->dst_row + y * p->dst_row,
+            p->data, p->src_row == p->dst_row ? p->valid_image : p->valid_row};
+        row.data.ptr = (const char *)p->data.ptr + z * p->src_image + y * p->src_row;
+        NTSTATUS status = _MTLBuffer_updateContents(&row);
+        if (status) return status;
+      }
+    }
+    return STATUS_SUCCESS;
+  }
+  id<MTLBuffer> buffer = (id<MTLBuffer>)p->buffer;
+  if (!buffer || p->offset + size > [buffer length]) return STATUS_INVALID_PARAMETER;
+  void *contents = [buffer contents];
+  if (!contents) return STATUS_INVALID_PARAMETER;
+  wmt_copy_texture_upload((char *)contents + p->offset, p->data.ptr, p->rows, p->depth,
+                          p->dst_row, p->src_row, p->src_image, p->valid_row, p->valid_image);
+#if !TARGET_OS_IOS
+  if ([buffer storageMode] == MTLStorageModeManaged)
+    [buffer didModifyRange:NSMakeRange(p->offset, size)];
+#endif
+  return STATUS_SUCCESS;
+}
+
 static NTSTATUS
 _WMTGetOSVersion(void *obj) {
   struct unixcall_get_os_version *params = obj;
@@ -6248,6 +6298,16 @@ _MTLBuffer_updateContents32(void *obj) {
 }
 
 static NTSTATUS
+_MTLBuffer_updateTextureContents32(void *obj) {
+  struct unixcall_mtlbuffer_updatetexturecontents *params = (struct unixcall_mtlbuffer_updatetexturecontents *)obj;
+  const void *guest = params->data.ptr;
+  params->data.ptr = wow_in(guest);
+  NTSTATUS status = _MTLBuffer_updateTextureContents(obj);
+  params->data.ptr = guest;
+  return status;
+}
+
+static NTSTATUS
 _DispatchData_alloc_init32(void *obj) {
   struct unixcall_generic_obj_uint64_obj_ret *params = obj;
   obj_handle_t guest = params->handle;
@@ -7020,6 +7080,7 @@ const void *__wine_unix_call_funcs[] = {
      * END of both tables, which is the only place a slot may be added --
      * rules 3 and 4 of section 7.4. 150 in both. */
     &_d3d9_nop,                         /* 150 */
+    &_MTLBuffer_updateTextureContents,   /* 151: append only */
 };
 
 #ifndef DXMT_NATIVE
@@ -7182,5 +7243,6 @@ const void *__wine_unix_call_wow64_funcs[] = {
      * sharing the 64-bit handler is correct, not a gap (section 7.11 says the
      * same about slots 47, 66, 67 and 72). */
     &_d3d9_nop,                         /* 150 */
+    &_MTLBuffer_updateTextureContents32, /* 151 */
 };
 #endif

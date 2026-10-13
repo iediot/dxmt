@@ -10,48 +10,17 @@
 
 namespace dxmt {
 
-// THE STORAGE CONTRACT: no page the application writes is ever referenced by a
-// command buffer. Every buffer is staged. Lock returns a host mirror we own and
-// Metal has never seen; the allocation a draw reads is Metal-owned, never
-// handed out, and is refreshed from that mirror.
+// Large drawable buffers default to guest-owned Shared Metal generations.
+// NOOVERWRITE promises that new writes do not overlap earlier GPU readers;
+// DISCARD renames, and a busy plain lock preserves contents in a fresh name.
+// Small buffers, remote Metal, and DXMT_D9_BUFFER_ALIAS=0 retain the mirror
+// and write-watch path. Lock ranges remain advisory in either mode.
 //
-// The condition is stated in terms of what the GPU USES rather than what Metal
-// has been told about, because that is what the livelock below turns on, and
-// because one path relies on the difference: a texture's MANAGED mirror is
-// wrapped in a Metal buffer at d3d9_texture.cpp ensureMirror so the device
-// backing pool can hold a single reference type. That buffer is written to the
-// texture's fields and never bound, never blitted from or to; uploads go
-// through the ring and readback writes the CPU backing. Wrapping alone does not
-// wire a page. If a future change ever gives the GPU work that reads it, the
-// pages the application writes become wired and this contract is broken.
-//
-// DXVK's DetermineMapMode (d3d9_common_buffer.cpp) sends DEFAULT+DYNAMIC down
-// its allowDirectBufferMapping arm instead, aliasing the Lock pointer onto the
-// backing queued draws read in place, and we followed that shape until two
-// platform facts ruled it out.
-//
-// First, such a pointer livelocks. Once the GPU has used the wrapping buffer
-// its pages are wired, and a store from translated code into a wired page that
-// carries translation state is rejected and re-executed at fault-service
-// cadence for as long as the wrap lives: 5,979 ns per store, against 0.25 ns
-// for the same store once any one of those conditions is absent. The
-// application is the one writer whose pages cannot be vetted, and it keeps
-// writing after Unlock, so there is no window in which handing it wrapped
-// memory is safe.
-//
-// Second, the alternative that would avoid the wrap is unreachable here.
-// Aliasing memory Metal itself allocates is what DXVK effectively does through
-// Vulkan, but Metal allocates above 4 GB in practice, so a 32-bit guest cannot
-// address it. Giving that guest a lock pointer at all requires wrapping pages
-// it can address, which is exactly the livelock. The divergence from DXVK is
-// forced by the address space, not chosen.
-//
-// Staging costs one copy per refresh, which on unified memory is DRAM
-// bandwidth rather than a transfer, and it buys back guest address space: the
-// allocation a draw reads is Metal-owned and charges none, where in-place
-// renames charged it per allocation in flight. Should a native or 64-bit guest
-// ever remove both premises, shared-storage direct mapping becomes the correct
-// answer again and this is the comment to re-examine.
+// Platform history: translated writes to Metal-wired pages carrying translation
+// state have previously faulted repeatedly. Direct mapping makes those pages
+// app-visible again; the env switch preserves the staged workaround for such
+// hosts. This is distinct from the write-watch protection faults eliminated by
+// aliasing. Runtime profiling is needed to distinguish the two.
 
 // Lock-flag sanitisation. The runtime silently drops flags that the
 // pool/usage/device combination does not honour before any of them take
@@ -84,7 +53,8 @@ sanitize_buffer_lock_flags(DWORD flags, D3DPOOL pool, DWORD usage, bool swvp_onl
 // tolerates it because the system-memory copy the application writes IS the
 // buffer there, so a write outside the announced window still reaches the draw.
 // Applications also keep writing after Unlock, which no bookkeeping finalised at
-// Unlock can survive. So a write lock marks the buffer dirty and nothing more;
+// Unlock can survive. So a write lock marks the buffer dirty; its flags govern
+// whether a rename is needed, but only write-watch can narrow the copy;
 // what a draw reads is decided from the draw, not from what the lock announced.
 //
 // Whether a Lock dirties the buffer at all. Post-sanitisation flags, so
@@ -96,6 +66,30 @@ inline bool
 buffer_lock_updates_dirty(DWORD flags) {
   return !(flags & D3DLOCK_READONLY);
 }
+
+// Lock ranges remain untrusted; write-watch observes the pages actually
+// stored to. In-place publication additionally needs NOOVERWRITE's promise
+// that no changed byte is read by an earlier draw. Remember unsafe locks even
+// when a later lock is NOOVERWRITE. With no per-Unlock flags, conservatively
+// retain an unsafe nested lock until the outermost Unlock.
+struct D3D9BufferRefreshState {
+  bool whole = true; // The initial allocation has never received the mirror.
+  bool heldWhole = false;
+
+  void
+  writeLock(DWORD flags) {
+    if (!(flags & D3DLOCK_NOOVERWRITE) || (flags & D3DLOCK_DISCARD))
+      whole = heldWhole = true;
+  }
+  void
+  unlockAll() {
+    heldWhole = false;
+  }
+  void
+  refreshed() {
+    whole = heldWhole;
+  }
+};
 
 // Nested-lock counter. D3D9 permits nested Lock/Unlock on one buffer, and only
 // the outer Unlock means the application has stopped writing, which is what the

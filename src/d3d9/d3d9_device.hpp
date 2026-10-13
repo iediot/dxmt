@@ -101,7 +101,8 @@ inline constexpr unsigned D3D9_MAX_PS_CONST_B = 16;
 // there); a narrower copy would leak the packed ring's neighbouring bytes.
 // This is DXVK's rule: a relative c# read forces the extent to the full
 // float count (dxso_compiler.cpp maxConstIndexF = floatCount). A
-// direct-addressing shader uploads only the app's sticky high-water mark.
+// direct-addressing shader uploads the larger of its static read extent and
+// the app's sticky high-water mark (combined by PackDrawConstants).
 inline constexpr uint32_t
 resolve_const_f_extent(uint32_t sticky_regs, bool uses_relative, uint32_t file_size) {
   if (uses_relative)
@@ -110,6 +111,7 @@ resolve_const_f_extent(uint32_t sticky_regs, bool uses_relative, uint32_t file_s
 }
 
 class MTLD3D9Interface;
+class MTLD3D9Surface;
 
 // D3D9StateBlockChanges (the per-category + per-render-state change-tracking
 // mask each MTLD3D9StateBlock owns) lives in d3d9_state_block_changes.hpp,
@@ -131,6 +133,8 @@ public:
       const D3DPRESENT_PARAMETERS &validatedParams, WMT::Reference<WMT::Device> &&metalDevice
   );
   ~MTLD3D9Device();
+  void smbTracePresent(MTLD3D9Surface *backbuffer);
+
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject) override;
   // D3D9 clamps Release-at-0. The device multiply-inherits (ComObject +
@@ -568,6 +572,21 @@ public:
   GetDisplayModeEx(UINT iSwapChain, D3DDISPLAYMODEEX *pMode, D3DDISPLAYROTATION *pRotation) override;
 
 private:
+  bool smbTraceActive() const;
+  void smbTraceDraw();
+  void smbTraceSurface(const char *label, MTLD3D9Surface *surface);
+  void smbReadPixels(const char *label, MTLD3D9Surface *surface);
+  // Caller-thread state only; retained resources are released at frame 121.
+  uint32_t m_smbFrame = 0;
+  uint64_t m_smbDraw = 0;
+  struct SmbTextureRecord {
+    Rc<dxmt::Texture> texture;
+    uint64_t bytes = 0;
+    uint64_t draws = 0;
+  };
+  std::unordered_map<dxmt::Texture *, SmbTextureRecord> m_smbTextures;
+  std::vector<Com<MTLD3D9Surface, false>> m_smbTargets;
+
   // Seed the D3D9-spec render-state defaults. Called once from the
   // ctor; mirrors DXVK's D3D9DeviceEx::ResetState in shape (the
   // wined3d defaults match value-for-value but are stored under
@@ -635,6 +654,9 @@ private:
   // Reset replaces those by hand with the new backbuffer + auto-DS.
   // Called by Reset; the ctor runs the equivalent code inline.
   void resetStateToDefaults(bool enableAutoDepthStencil);
+  // The body of Reset, under the device lock; Reset wraps it to log the
+  // result (ml2330). Not STDMETHODCALLTYPE, so the census does not count it.
+  HRESULT resetDevice(D3DPRESENT_PARAMETERS *pPresentationParameters);
   // Allocates an implicit depth-stencil surface matching `params` and
   // assigns it to m_depthStencilSurface. Used by the ctor for the
   // first auto-DS creation and by Reset to rebuild after a resolution

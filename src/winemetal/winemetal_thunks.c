@@ -1304,3 +1304,12 @@ WINEMETAL_API void
 MadeiraCtl(struct madeira_ctl_args *args) {
   UNIX_CALL(138, args);
 }
+
+WINEMETAL_API void
+MTLBuffer_updateTextureContents(obj_handle_t buffer, uint64_t offset, struct WMTConstMemoryPointer data,
+                               uint64_t rows, uint64_t depth, uint64_t dst_row, uint64_t src_row,
+                               uint64_t src_image, uint64_t valid_row, uint64_t valid_image) {
+  struct unixcall_mtlbuffer_updatetexturecontents params = {
+      buffer, offset, data, rows, depth, dst_row, src_row, src_image, valid_row, valid_image};
+  UNIX_CALL(151, &params);
+}

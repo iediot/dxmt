@@ -321,6 +321,14 @@ struct unixcall_mtlbuffer_updatecontents {
   uint64_t length;
 };
 
+// All fields remain 64-bit across PE/Unix/WoW64; only data.ptr needs translation.
+struct unixcall_mtlbuffer_updatetexturecontents {
+  obj_handle_t buffer;
+  uint64_t offset;
+  struct WMTConstMemoryPointer data;
+  uint64_t rows, depth, dst_row, src_row, src_image, valid_row, valid_image;
+};
+
 struct unixcall_mtlsharedevent_setevent {
   obj_handle_t shared_event;
   obj_handle_t event_handle;

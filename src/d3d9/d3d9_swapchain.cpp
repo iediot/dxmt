@@ -875,6 +875,8 @@ MTLD3D9SwapChain::Present(
   // that never pass rects never allocate it. The rects are COPY-only per
   // the spec; other swap effects ignore them (wined3d swapchain.c honours
   // them through its front-buffer blit, DXVK through its present region).
+  if (d9SmbTraceEnabled())
+    m_device->smbTracePresent(backBuffer());
   const uint32_t bb_w = m_params.BackBufferWidth;
   const uint32_t bb_h = m_params.BackBufferHeight;
   bool canvas_seed = false;

@@ -65,6 +65,7 @@ private:
   Rc<BufferAllocation> name_;
   uint32_t name_suballocation_ = 0;
   bool owned_by_command_list_ = false;
+  bool alias_warned_ = false;
   bool trimmed_last_ = false;      /* ml685: trim-regret latch */
 };
 

@@ -189,7 +189,9 @@ public:
       .Format = desc_.Format,
       .SampleDesc = desc_.SampleDesc,
       .Usage = D3D11_USAGE_DEFAULT,
-      .BindFlags = D3D11_BIND_RENDER_TARGET,
+      /* the presenter samples the backbuffer (fs_present_quad), so it is
+       * always a shader resource; Metal validation aborts on usage 0x04 */
+      .BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE,
       .CPUAccessFlags = {},
       .MiscFlags = {},
       .TextureLayout = {},
@@ -739,8 +741,9 @@ public:
     /* iOS-Madeira 2026-07-03: [PRESENT_GAP] — attribute the exactly-20-FPS
      * ceiling. Splits each frame into time spent INSIDE Present1 (our
      * present path: SyncFrame wait, Commit, PresentBoundary) vs OUTSIDE
-     * (game sim/render/its own frame limiter). gap≈50ms with inside≈0 ⇒
-     * the game paces itself between presents; inside≈50ms ⇒ we block.
+     * (game work and graphics API calls between presents, including uploads
+     * and resource/shader creation). A long gap with inside≈0 does not isolate
+     * the game or absolve the graphics layer; inside≈50ms locates a Present wait.
      * Also logs the SyncInterval the game passes (3 @60Hz would = 20). */
     {
       auto now = std::chrono::steady_clock::now();
@@ -748,6 +751,8 @@ public:
         double gap_ms = std::chrono::duration<double, std::milli>(now - madeira_gap_last_entry_).count();
         madeira_gap_sum_ms_ += gap_ms;
         madeira_gap_max_ms_ = std::max(madeira_gap_max_ms_, gap_ms);
+        madeira_gap_over_50_ += gap_ms > 50.0;
+        madeira_gap_over_100_ += gap_ms > 100.0;
       }
       madeira_gap_last_entry_ = now;
       madeira_gap_sync_min_ = std::min(madeira_gap_sync_min_, SyncInterval);
@@ -755,11 +760,13 @@ public:
       if ((++madeira_gap_count_ % 64) == 0) {
         Logger::info(std::format(
             "[PRESENT_GAP] #{} gap_avg={:.1f}ms gap_max={:.1f}ms inside_avg={:.1f}ms "
-            "inside_max={:.1f}ms sync_interval={}..{}",
+            "inside_max={:.1f}ms sync_interval={}..{} over_50ms={} over_100ms={}",
             madeira_gap_count_, madeira_gap_sum_ms_ / 64.0, madeira_gap_max_ms_,
             madeira_inside_sum_ms_ / 64.0, madeira_inside_max_ms_,
-            madeira_gap_sync_min_, madeira_gap_sync_max_));
+            madeira_gap_sync_min_, madeira_gap_sync_max_,
+            madeira_gap_over_50_, madeira_gap_over_100_));
         madeira_gap_sum_ms_ = 0; madeira_gap_max_ms_ = 0;
+        madeira_gap_over_50_ = 0; madeira_gap_over_100_ = 0;
         madeira_inside_sum_ms_ = 0; madeira_inside_max_ms_ = 0;
         madeira_gap_sync_min_ = ~0u; madeira_gap_sync_max_ = 0;
       }
@@ -1131,6 +1138,7 @@ private:
    * thread, so plain members are fine. */
   std::chrono::steady_clock::time_point madeira_gap_last_entry_{};
   uint64_t madeira_gap_count_ = 0;
+  uint32_t madeira_gap_over_50_ = 0, madeira_gap_over_100_ = 0;
   double madeira_gap_sum_ms_ = 0, madeira_gap_max_ms_ = 0;
   double madeira_inside_sum_ms_ = 0, madeira_inside_max_ms_ = 0;
   UINT madeira_gap_sync_min_ = ~0u, madeira_gap_sync_max_ = 0;
