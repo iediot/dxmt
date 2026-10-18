@@ -2071,7 +2071,17 @@ public:
   void
   STDMETHODCALLTYPE
   SwapDeviceContextState(ID3DDeviceContextState *pState, ID3DDeviceContextState **ppPreviousState) override {
-    IMPLEMENT_ME
+    // Madeira: minimal, instead of aborting. Wine's d2d1 swaps its own state in around
+    // every draw (the Rockstar Games Launcher's UI exited with code 3 here) and binds
+    // everything it draws with; the caller's bindings are left as d2d1 set them, not
+    // restored. The previous state handed back is an empty one.
+    static bool logged = false;
+    if (!logged) {
+      logged = true;
+      Logger::warn("SwapDeviceContextState: minimal (bindings are not saved or restored)");
+    }
+    if (ppPreviousState)
+      *ppPreviousState = ref(new MTLD3D11DeviceContextState(device));
   }
 
   void
