@@ -1995,7 +1995,9 @@ WINEMETAL_API obj_handle_t MTLHeap_newBufferAtOffset(obj_handle_t heap, struct W
  *   2  config get: madeira.cfg value of key <name> copied into ptr/len (NUL-terminated); ret = 1 when set
  *   7  ml2000 memory: len = os_proc_available_memory() bytes, ptr = phys_footprint bytes; ret = 1 when known
  *      (the only op the wow64 entry forwards; 0 in remote mode)
- * Local in both backends: it never touches a Metal object. */
+ *  10  local64 PSO warm-up: ptr={device,info,vd} uint64s, len=0render/1VD/2compute;
+ *      ret=1 supported (budget/full queues skip without blocking), 0 unavailable.
+ *      Descriptors copied and referenced Metal objects retained before returning. */
 struct madeira_ctl_args {
   uint32_t op;
   uint32_t ret;

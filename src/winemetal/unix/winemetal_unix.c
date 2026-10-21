@@ -6457,11 +6457,15 @@ void madeira_set_fence_mode(int mode) {
   g_madeira_fence_req = mode;
   fprintf(stderr, "[fence-mode] ml1136 UI requested fence-chain %d\n", mode);
 }
+#include "pipeline_warm.h"
 static NTSTATUS _madeira_ctl(void *args) {
   struct madeira_ctl_args *a = args;
   if (!a) return STATUS_SUCCESS;
   a->ret = 0;
   switch (a->op) {
+  case 10: /* 64-bit local PSO warm-up; descriptor pointers copied synchronously */
+    a->ret = madeira_warm_submit((const void *)(uintptr_t)a->ptr, (unsigned)a->len);
+    break;
   case 0: {
     int n;
     do { n = g_madeira_capture_req; } while (n && !__sync_bool_compare_and_swap(&g_madeira_capture_req, n, 0));
