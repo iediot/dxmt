@@ -1099,6 +1099,7 @@ static int parse_shader(
 
   auto sm50_shader = new SM50ShaderInternal();
   sm50_shader->shader_type = CodeParser.ShaderType();
+  sm50_shader->madeira_sm_major = CodeParser.ShaderMajorVersion(); /* madeira-bcd: vertex fetch bounds */
   auto shader_info = &(sm50_shader->shader_info);
 
   {

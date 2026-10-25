@@ -7,6 +7,10 @@
 #include "util_string.hpp"
 #include "wsi_window.hpp"
 #include "Metal.hpp"
+/* madeira x64 graphics factory: the header madeira_d3d12 uses for its own x64
+ * entries (madeira-d3d12/src/pe in the Madeira tree, which this submodule sits
+ * in, as winemetal's unix side finds build/madeira_cfg.h). */
+#include "../../../madeira-d3d12/src/pe/madeira_graphics_entry.h"
 #include <atomic>
 
 namespace dxmt {
@@ -69,7 +73,7 @@ public:
 
   HRESULT STDMETHODCALLTYPE
   CreateSwapChain(IUnknown *pDevice, DXGI_SWAP_CHAIN_DESC *pDesc,
-                  IDXGISwapChain **ppSwapChain) final {
+                  IDXGISwapChain **ppSwapChain) override {
     if (ppSwapChain == nullptr || pDesc == nullptr || pDevice == nullptr)
       return DXGI_ERROR_INVALID_CALL;
 
@@ -103,7 +107,7 @@ public:
   HRESULT STDMETHODCALLTYPE CreateSwapChainForHwnd(
       IUnknown *pDevice, HWND hWnd, const DXGI_SWAP_CHAIN_DESC1 *pDesc,
       const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *pFullscreenDesc,
-      IDXGIOutput *pRestrictToOutput, IDXGISwapChain1 **ppSwapChain) final {
+      IDXGIOutput *pRestrictToOutput, IDXGISwapChain1 **ppSwapChain) override {
     InitReturnPtr(ppSwapChain);
 
     if (!ppSwapChain || !pDesc || !hWnd || !pDevice)
@@ -140,7 +144,7 @@ public:
 
   HRESULT STDMETHODCALLTYPE CreateSwapChainForCoreWindow(
       IUnknown *pDevice, IUnknown *pWindow, const DXGI_SWAP_CHAIN_DESC1 *pDesc,
-      IDXGIOutput *pRestrictToOutput, IDXGISwapChain1 **ppSwapChain) final {
+      IDXGIOutput *pRestrictToOutput, IDXGISwapChain1 **ppSwapChain) override {
     InitReturnPtr(ppSwapChain);
 
     ERR("Not implemented");
@@ -149,7 +153,7 @@ public:
 
   HRESULT STDMETHODCALLTYPE CreateSwapChainForComposition(
       IUnknown *pDevice, const DXGI_SWAP_CHAIN_DESC1 *pDesc,
-      IDXGIOutput *pRestrictToOutput, IDXGISwapChain1 **ppSwapChain) final {
+      IDXGIOutput *pRestrictToOutput, IDXGISwapChain1 **ppSwapChain) override {
     InitReturnPtr(ppSwapChain);
 
     ERR("Not implemented");
@@ -214,7 +218,7 @@ public:
   }
 
   HRESULT STDMETHODCALLTYPE MakeWindowAssociation(HWND WindowHandle,
-                                                  UINT Flags) final {
+                                                  UINT Flags) override {
     if (Flags) {
       WARN("MakeWindowAssociation: Ignoring flags ", Flags);
     }
@@ -346,10 +350,82 @@ private:
   HWND associated_window_ = nullptr;
 };
 
+
+/* madeira x64 graphics factory begin */
+class MTLDXGIHookFactory : public MTLDXGIFactory {
+public:
+  explicit MTLDXGIHookFactory(UINT flags) : MTLDXGIFactory(flags) {}
+  void InitializeEntries() {
+    void **original, **replacement = entry_vtable_ + 2;
+    void *com_object = static_cast<IDXGIFactory7 *>(this);
+    __builtin_memcpy(&original, com_object, sizeof(original));
+    mad_x64_graphics_factory_table(original, entry_vtable_, &__ImageBase);
+    __builtin_memcpy(com_object, &replacement, sizeof(replacement));
+  }
+  MAD_X64_GRAPHICS_ENTRY HRESULT STDMETHODCALLTYPE
+  MakeWindowAssociation(HWND window, UINT flags) override;
+  MAD_X64_GRAPHICS_ENTRY HRESULT STDMETHODCALLTYPE
+  CreateSwapChain(IUnknown *device, DXGI_SWAP_CHAIN_DESC *desc,
+                  IDXGISwapChain **out) override;
+  MAD_X64_GRAPHICS_ENTRY HRESULT STDMETHODCALLTYPE
+  CreateSwapChainForHwnd(IUnknown *device, HWND window,
+      const DXGI_SWAP_CHAIN_DESC1 *desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *fs,
+      IDXGIOutput *restrict_output, IDXGISwapChain1 **out) override;
+  MAD_X64_GRAPHICS_ENTRY HRESULT STDMETHODCALLTYPE
+  CreateSwapChainForCoreWindow(IUnknown *device, IUnknown *window,
+      const DXGI_SWAP_CHAIN_DESC1 *desc, IDXGIOutput *restrict_output,
+      IDXGISwapChain1 **out) override;
+  MAD_X64_GRAPHICS_ENTRY HRESULT STDMETHODCALLTYPE
+  CreateSwapChainForComposition(IUnknown *device, const DXGI_SWAP_CHAIN_DESC1 *desc,
+      IDXGIOutput *restrict_output, IDXGISwapChain1 **out) override;
+private:
+  void *entry_vtable_[36];
+};
+
+HRESULT STDMETHODCALLTYPE
+MTLDXGIHookFactory::MakeWindowAssociation(HWND window, UINT flags) {
+  return MTLDXGIFactory::MakeWindowAssociation(window, flags);
+}
+HRESULT STDMETHODCALLTYPE
+MTLDXGIHookFactory::CreateSwapChain(IUnknown *device, DXGI_SWAP_CHAIN_DESC *desc,
+                                 IDXGISwapChain **out) {
+  return MTLDXGIFactory::CreateSwapChain(device, desc, out);
+}
+HRESULT STDMETHODCALLTYPE
+MTLDXGIHookFactory::CreateSwapChainForHwnd(IUnknown *device, HWND window,
+    const DXGI_SWAP_CHAIN_DESC1 *desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *fs,
+    IDXGIOutput *restrict_output, IDXGISwapChain1 **out) {
+  return MTLDXGIFactory::CreateSwapChainForHwnd(device, window, desc, fs, restrict_output, out);
+}
+HRESULT STDMETHODCALLTYPE
+MTLDXGIHookFactory::CreateSwapChainForCoreWindow(IUnknown *device, IUnknown *window,
+    const DXGI_SWAP_CHAIN_DESC1 *desc, IDXGIOutput *restrict_output,
+    IDXGISwapChain1 **out) {
+  return MTLDXGIFactory::CreateSwapChainForCoreWindow(device, window, desc, restrict_output, out);
+}
+HRESULT STDMETHODCALLTYPE
+MTLDXGIHookFactory::CreateSwapChainForComposition(IUnknown *device,
+    const DXGI_SWAP_CHAIN_DESC1 *desc, IDXGIOutput *restrict_output,
+    IDXGISwapChain1 **out) {
+  return MTLDXGIFactory::CreateSwapChainForComposition(device, desc, restrict_output, out);
+}
+/* madeira x64 graphics factory end */
+
 extern "C" HRESULT __stdcall CreateDXGIFactory2(UINT Flags, REFIID riid,
                                                 void **ppFactory) {
   try {
-    MTLDXGIFactory* factory = new MTLDXGIFactory(Flags);
+    const bool patchable = mad_x64_graphics_entry_enabled();
+    MTLDXGIFactory* factory;
+    if (patchable) {
+      auto* hook_factory = new MTLDXGIHookFactory(Flags);
+      hook_factory->InitializeEntries();
+      factory = hook_factory;
+    } else {
+      factory = new MTLDXGIFactory(Flags);
+    }
+    static std::atomic<bool> noted{false};
+    if (patchable && !noted.exchange(true))
+      Logger::info("[graphics-entry] x64 patchable DXGI factory methods enabled (PE entries)");
     HRESULT hr = factory->QueryInterface(riid, ppFactory);
     factory->Release();
 

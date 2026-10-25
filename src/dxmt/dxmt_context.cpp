@@ -1,4 +1,7 @@
 #include "dxmt_context.hpp"
+#if defined(__i386__)  /* madeira-bcd: 32-bit (i386) builds only, as the fork shipped it */
+#include <cstring>
+#endif
 #include "Metal.hpp"
 #include "dxmt_command_queue.hpp"
 #include "dxmt_format.hpp"
@@ -101,6 +104,48 @@ ArgumentEncodingContext::encodeVertexBuffers(uint32_t slot_mask, uint64_t offset
   }
 }
 
+#if defined(__i386__)  /* madeira-bcd: 32-bit (i386) builds only, as the fork shipped it */
+template void ArgumentEncodingContext::encodeConstantBuffers<PipelineStage::Vertex, PipelineKind::Ordinary>(
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
+    uint64_t argument_buffer_offset, const uint32_t *short_cb
+);
+template void ArgumentEncodingContext::encodeConstantBuffers<PipelineStage::Pixel, PipelineKind::Ordinary>(
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
+    uint64_t argument_buffer_offset, const uint32_t *short_cb
+);
+template void ArgumentEncodingContext::encodeConstantBuffers<PipelineStage::Vertex, PipelineKind::Tessellation>(
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
+    uint64_t argument_buffer_offset, const uint32_t *short_cb
+);
+template void ArgumentEncodingContext::encodeConstantBuffers<PipelineStage::Pixel, PipelineKind::Tessellation>(
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
+    uint64_t argument_buffer_offset, const uint32_t *short_cb
+);
+template void ArgumentEncodingContext::encodeConstantBuffers<PipelineStage::Hull, PipelineKind::Tessellation>(
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
+    uint64_t argument_buffer_offset, const uint32_t *short_cb
+);
+template void ArgumentEncodingContext::encodeConstantBuffers<PipelineStage::Domain, PipelineKind::Tessellation>(
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
+    uint64_t argument_buffer_offset, const uint32_t *short_cb
+);
+template void ArgumentEncodingContext::encodeConstantBuffers<PipelineStage::Compute, PipelineKind::Ordinary>(
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
+    uint64_t argument_buffer_offset, const uint32_t *short_cb
+);
+template void ArgumentEncodingContext::encodeConstantBuffers<PipelineStage::Vertex, PipelineKind::Geometry>(
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
+    uint64_t argument_buffer_offset, const uint32_t *short_cb
+);
+template void ArgumentEncodingContext::encodeConstantBuffers<PipelineStage::Geometry, PipelineKind::Geometry>(
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
+    uint64_t argument_buffer_offset, const uint32_t *short_cb
+);
+template void ArgumentEncodingContext::encodeConstantBuffers<PipelineStage::Pixel, PipelineKind::Geometry>(
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
+    uint64_t argument_buffer_offset, const uint32_t *short_cb
+);
+#else
 template void ArgumentEncodingContext::encodeConstantBuffers<PipelineStage::Vertex, PipelineKind::Ordinary>(
     const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
     uint64_t argument_buffer_offset
@@ -141,10 +186,15 @@ template void ArgumentEncodingContext::encodeConstantBuffers<PipelineStage::Pixe
     const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
     uint64_t argument_buffer_offset
 );
+#endif
 
 template <PipelineStage stage, PipelineKind kind>
 void
+#if defined(__i386__)  /* madeira-bcd: 32-bit (i386) builds only, as the fork shipped it */
+ArgumentEncodingContext::encodeConstantBuffers(const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT * constant_buffers, uint64_t offset, const uint32_t *short_cb) {
+#else
 ArgumentEncodingContext::encodeConstantBuffers(const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT * constant_buffers, uint64_t offset) {
+#endif
   uint64_t *encoded_buffer = getMappedArgumentBuffer<uint64_t, stage == PipelineStage::Compute>(offset);
 
   constexpr bool PreRasterStage = stage == PipelineStage::Vertex || stage == PipelineStage::Domain ||
@@ -166,6 +216,31 @@ ArgumentEncodingContext::encodeConstantBuffers(const MTL_SHADER_REFLECTION *refl
       auto [argbuf_alloc, argbuf_offset] = access<PreRasterStage>(argbuf, cbuf.offset, valid_length, DXMT_ENCODER_RESOURCE_ACESS_READ);
       encoded_buffer[arg.StructurePtrOffset] = argbuf_alloc->gpuAddress() + argbuf_offset + cbuf.offset;
       makeResident<stage, kind>(argbuf.ptr());
+#if defined(__i386__)  /* madeira-bcd: 32-bit (i386) builds only, as the fork shipped it */
+      /* madeira-bcd: short constant buffers -- bind a zero-padded copy. D3D reads
+       * past the end of a constant buffer as 0; Metal would read the next bytes. */
+      if (short_cb && arg.SM50BindingSlot < 14 && short_cb[2 * arg.SM50BindingSlot]) {
+        uint32_t pad_off = short_cb[2 * arg.SM50BindingSlot] - 1, pad_bytes = short_cb[2 * arg.SM50BindingSlot + 1];
+        /* The CPU mapping is the buffer's storage on iOS (unified memory; a
+         * GpuManaged buffer is CpuPlaced and Managed does not exist there). */
+        auto src = (const char *)argbuf_alloc->mappedMemory(0);
+        static unsigned madeira_cb_copied, madeira_cb_nomap;
+        if (!src) {
+          if (++madeira_cb_nomap <= 4 || (madeira_cb_nomap & 0xffff) == 0)
+            WARN("[cb-short] madeira-bcd encode: no CPU mapping, copy skipped (#", madeira_cb_nomap, ")");
+        } else if (++madeira_cb_copied <= 4 || (madeira_cb_copied & 0xfffff) == 0) {
+          WARN("[cb-short] madeira-bcd encode: zero-padded copy bound (#", madeira_cb_copied, ", ", pad_bytes, " bytes)");
+        }
+        if (src) {
+          char *dst = getMappedArgumentBuffer<char, stage == PipelineStage::Compute>(pad_off);
+          size_t have = valid_length < pad_bytes ? valid_length : pad_bytes;
+          memcpy(dst, src + argbuf_offset + cbuf.offset, have);
+          memset(dst + have, 0, pad_bytes - have);
+          encoded_buffer[arg.StructurePtrOffset] = getArgumentBufferGpuAddress<stage == PipelineStage::Compute>(
+              getFinalArgumentBufferOffset<stage == PipelineStage::Compute>(pad_off));
+        }
+      }
+#endif
       break;
     }
     default:
@@ -708,7 +783,12 @@ ArgumentEncodingContext::startRenderPass(
   encoder_info->dsv_planar_flags = dsv_planar_flags;
   encoder_info->dsv_readonly_flags = dsv_readonly_flags;
   encoder_info->render_target_count = render_target_count;
+#if defined(__i386__)  /* madeira-bcd: 32-bit (i386) builds only, as the fork shipped it */
+  auto [gpu_buffer_contents, gpu_buffer_, offset, gpu_address_] = queue_.AllocateArgumentBufferGpu(seq_id_, encoder_argbuf_size);
+  encoder_info->allocated_argbuf_gpu_address = gpu_address_;
+#else
   auto [gpu_buffer_contents, gpu_buffer_, offset] = queue_.AllocateArgumentBuffer(seq_id_, encoder_argbuf_size);
+#endif
   encoder_info->allocated_argbuf = gpu_buffer_;
   encoder_info->allocated_argbuf_offset = offset;
   encoder_info->allocated_argbuf_mapping = gpu_buffer_contents;
@@ -730,7 +810,12 @@ ArgumentEncodingContext::startComputePass(uint64_t encoder_argbuf_size) {
   encoder_info->cmd_head.type = WMTComputeCommandNop;
   encoder_info->cmd_head.next.set(0);
   encoder_info->cmd_tail = (wmtcmd_base *)&encoder_info->cmd_head;
+#if defined(__i386__)  /* madeira-bcd: 32-bit (i386) builds only, as the fork shipped it */
+  auto [gpu_buffer_contents, gpu_buffer_, offset, gpu_address_] = queue_.AllocateArgumentBufferGpu(seq_id_, encoder_argbuf_size);
+  encoder_info->allocated_argbuf_gpu_address = gpu_address_;
+#else
   auto [gpu_buffer_contents, gpu_buffer_, offset] = queue_.AllocateArgumentBuffer(seq_id_, encoder_argbuf_size);
+#endif
   encoder_info->allocated_argbuf = gpu_buffer_;
   encoder_info->allocated_argbuf_offset = offset;
   encoder_info->allocated_argbuf_mapping = gpu_buffer_contents;

@@ -1011,10 +1011,174 @@ NvAPI_GPU_GetVirtualFrameBufferSize(NvPhysicalGpuHandle hPhysicalGpu, NvU32 *pSi
   return dxmt::NvAPI_GPU_GetPhysicalFrameBufferSize(hPhysicalGpu, pSize);
 }
 
+
+/* madeira-bcd: NVAPI trace (tools/patch-nvapi-trace.py). */
+static const char *madeira_nv_name(NvU32 id) {
+  for (auto &iface : nvapi_interface_table)
+    if (iface.id == id)
+      return iface.func;
+  return "?";
+}
+
+/* The first calls of an entry point, and its later failures, are logged. */
+static bool madeira_nv_should_log(std::atomic<unsigned> &calls, NvAPI_Status s) {
+  unsigned k = calls.fetch_add(1, std::memory_order_relaxed);
+  return k < 6 || (s != NVAPI_OK && k < 40);
+}
+
+template <auto Fn, NvU32 Id> struct madeira_nv_trace;
+template <typename... A, NvAPI_Status (*Fn)(A...), NvU32 Id>
+struct madeira_nv_trace<Fn, Id> {
+  static NvAPI_Status __cdecl call(A... a) {
+    static std::atomic<unsigned> calls{0};
+    NvAPI_Status s = Fn(a...);
+    if (madeira_nv_should_log(calls, s))
+      Logger::info(str::format("[nvapi] ", madeira_nv_name(Id), " -> ", int(s)));
+    return s;
+  }
+};
+
+static std::string madeira_nv_str(const char *s, size_t cap) {
+  if (!s)
+    return "(null)";
+  size_t n = 0;
+  while (n < cap && s[n])
+    n++;
+  return std::string(s, n) + (n == cap ? "[no NUL]" : "");
+}
+
+/* The adapter name EnumDisplayDevices gives the primary display. */
+static bool madeira_nv_is_primary_adapter_name(const char *name) {
+  DISPLAY_DEVICEA dd = {};
+  dd.cb = sizeof(dd);
+  for (DWORD i = 0; name && EnumDisplayDevicesA(nullptr, i, &dd, 0); i++) {
+    if ((dd.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) && !_stricmp(dd.DeviceName, name))
+      return true;
+    dd = {};
+    dd.cb = sizeof(dd);
+  }
+  return false;
+}
+
+static NvAPI_Status __cdecl madeira_nv_DISP_GetDisplayIdByDisplayName(const char *displayName, NvU32 *displayId) {
+  static std::atomic<unsigned> calls{0};
+  NvAPI_Status s = dxmt::NvAPI_DISP_GetDisplayIdByDisplayName(displayName, displayId);
+  bool fallback = false;
+  /* One display on this port: its adapter's name is that display, whatever
+   * GetMonitorInfo calls the monitor. */
+  if (s == NVAPI_NVIDIA_DEVICE_NOT_FOUND && displayId && madeira_nv_is_primary_adapter_name(displayName)) {
+    *displayId = WMTGetPrimaryDisplayId();
+    s = NVAPI_OK;
+    fallback = true;
+  }
+  if (madeira_nv_should_log(calls, s))
+    Logger::info(str::format("[nvapi] NvAPI_DISP_GetDisplayIdByDisplayName(\"", madeira_nv_str(displayName, 64),
+                             "\") -> ", int(s), s == NVAPI_OK && displayId ? str::format(" id=0x", std::hex, *displayId) : "",
+                             fallback ? " (primary adapter name; GetMonitorInfo did not match)" : ""));
+  return s;
+}
+
+static NvAPI_Status __cdecl madeira_nv_GetAssociatedNvidiaDisplayHandle(const char *szDisplayName, NvDisplayHandle *pNvDispHandle) {
+  static std::atomic<unsigned> calls{0};
+  NvAPI_Status s = dxmt::NvAPI_GetAssociatedNvidiaDisplayHandle(szDisplayName, pNvDispHandle);
+  if (madeira_nv_should_log(calls, s))
+    Logger::info(str::format("[nvapi] NvAPI_GetAssociatedNvidiaDisplayHandle(\"", madeira_nv_str(szDisplayName, 64),
+                             "\") -> ", int(s), s == NVAPI_OK && pNvDispHandle ? str::format(" handle=", (void *)*pNvDispHandle) : ""));
+  return s;
+}
+
+static NvAPI_Status __cdecl madeira_nv_SYS_GetDriverAndBranchVersion(NvU32 *pDriverVersion, NvAPI_ShortString szBuildBranchString) {
+  static std::atomic<unsigned> calls{0};
+  NvAPI_Status s = dxmt::NvAPI_SYS_GetDriverAndBranchVersion(pDriverVersion, szBuildBranchString);
+  if (madeira_nv_should_log(calls, s))
+    Logger::info(str::format("[nvapi] NvAPI_SYS_GetDriverAndBranchVersion -> ", int(s),
+                             s == NVAPI_OK ? str::format(" version=", *pDriverVersion, " branch=\"",
+                                                         madeira_nv_str(szBuildBranchString, NVAPI_SHORT_STRING_MAX), "\"") : ""));
+  return s;
+}
+
+static NvAPI_Status __cdecl madeira_nv_GetDisplayDriverVersion(NvDisplayHandle hNvDisplay, NV_DISPLAY_DRIVER_VERSION *pVersion) {
+  static std::atomic<unsigned> calls{0};
+  NvAPI_Status s = dxmt::NvAPI_GetDisplayDriverVersion(hNvDisplay, pVersion);
+  if (madeira_nv_should_log(calls, s))
+    Logger::info(str::format("[nvapi] NvAPI_GetDisplayDriverVersion(", (void *)hNvDisplay, ") -> ", int(s),
+                             s == NVAPI_OK ? str::format(" version=", pVersion->drvVersion, " branch=\"",
+                                                         madeira_nv_str(pVersion->szBuildBranchString, NVAPI_SHORT_STRING_MAX),
+                                                         "\" adapter=\"", madeira_nv_str(pVersion->szAdapterString, NVAPI_SHORT_STRING_MAX), "\"")
+                                           : pVersion ? str::format(" (struct version 0x", std::hex, pVersion->version, ")") : ""));
+  return s;
+}
+
+static NvAPI_Status __cdecl madeira_nv_EnumPhysicalGPUs(NvPhysicalGpuHandle nvGPUHandle[NVAPI_MAX_PHYSICAL_GPUS], NvU32 *pGpuCount) {
+  static std::atomic<unsigned> calls{0};
+  NvAPI_Status s = dxmt::NvAPI_EnumPhysicalGPUs(nvGPUHandle, pGpuCount);
+  if (madeira_nv_should_log(calls, s))
+    Logger::info(str::format("[nvapi] NvAPI_EnumPhysicalGPUs -> ", int(s),
+                             s == NVAPI_OK ? str::format(" count=", *pGpuCount, " first=", (void *)nvGPUHandle[0]) : ""));
+  return s;
+}
+
+static NvAPI_Status __cdecl madeira_nv_GPU_GetConnectedDisplayIds(NvPhysicalGpuHandle hPhysicalGpu, NV_GPU_DISPLAYIDS *pDisplayIds,
+                                                                  NvU32 *pDisplayIdCount, NvU32 flags) {
+  static std::atomic<unsigned> calls{0};
+  NvAPI_Status s = dxmt::NvAPI_GPU_GetConnectedDisplayIds(hPhysicalGpu, pDisplayIds, pDisplayIdCount, flags);
+  if (madeira_nv_should_log(calls, s))
+    Logger::info(str::format("[nvapi] NvAPI_GPU_GetConnectedDisplayIds(", (void *)hPhysicalGpu, ", flags=0x", std::hex, flags,
+                             ") -> ", std::dec, int(s), pDisplayIdCount ? str::format(" count=", *pDisplayIdCount) : "",
+                             s == NVAPI_OK && pDisplayIds && pDisplayIdCount && *pDisplayIdCount
+                                 ? str::format(" first=0x", std::hex, pDisplayIds[0].displayId) : ""));
+  return s;
+}
+
+static NvAPI_Status __cdecl madeira_nv_DISP_GetGDIPrimaryDisplayId(NvU32 *displayId) {
+  static std::atomic<unsigned> calls{0};
+  NvAPI_Status s = dxmt::NvAPI_DISP_GetGDIPrimaryDisplayId(displayId);
+  if (madeira_nv_should_log(calls, s))
+    Logger::info(str::format("[nvapi] NvAPI_DISP_GetGDIPrimaryDisplayId -> ", int(s),
+                             s == NVAPI_OK ? str::format(" id=0x", std::hex, *displayId) : ""));
+  return s;
+}
+
+static NvAPI_Status __cdecl madeira_nv_GPU_GetAdapterIdFromPhysicalGpu(NvPhysicalGpuHandle hPhysicalGpu, void *pOSAdapterId) {
+  static std::atomic<unsigned> calls{0};
+  NvAPI_Status s = dxmt::NvAPI_GPU_GetAdapterIdFromPhysicalGpu(hPhysicalGpu, pOSAdapterId);
+  if (madeira_nv_should_log(calls, s)) {
+    LUID l = s == NVAPI_OK ? *reinterpret_cast<LUID *>(pOSAdapterId) : LUID{};
+    Logger::info(str::format("[nvapi] NvAPI_GPU_GetAdapterIdFromPhysicalGpu(", (void *)hPhysicalGpu, ") -> ", int(s),
+                             " luid=", std::hex, l.HighPart, ":", l.LowPart));
+  }
+  return s;
+}
+
+static NvAPI_Status __cdecl madeira_nv_GPU_GetFullName(NvPhysicalGpuHandle hPhysicalGpu, NvAPI_ShortString szName) {
+  static std::atomic<unsigned> calls{0};
+  NvAPI_Status s = dxmt::NvAPI_GPU_GetFullName(hPhysicalGpu, szName);
+  if (madeira_nv_should_log(calls, s))
+    Logger::info(str::format("[nvapi] NvAPI_GPU_GetFullName -> ", int(s),
+                             s == NVAPI_OK ? str::format(" \"", madeira_nv_str(szName, NVAPI_SHORT_STRING_MAX), "\"") : ""));
+  return s;
+}
+
 extern "C" __cdecl void *nvapi_QueryInterface(NvU32 id) {
+  {
+    static NvU32 seen[256];
+    static unsigned nseen;
+    bool known = false;
+    for (unsigned i = 0; i < nseen; i++)
+      if (seen[i] == id) { known = true; break; }
+    if (!known && nseen < 256) {
+      seen[nseen++] = id;
+      const char *name = "?";
+      for (auto &iface : nvapi_interface_table)
+        if (iface.id == id) { name = iface.func; break; }
+      char line[160];  /* madeira-bcd: NVAPI trace: the Logger reaches the session log */
+      snprintf(line, sizeof(line), "[nvapi] query 0x%08x %s", (unsigned)id, name);
+      Logger::info(line);
+    }
+  }
   switch (id) {
   case 0x0150e828:
-    return (void *)&NvAPI_Initialize;
+    return (void *)&madeira_nv_trace<&dxmt::NvAPI_Initialize, 0x0150e828u>::call;
   case 0x33c7358c:
   case 0x593e8644:
   case 0xad298d3f:
@@ -1026,13 +1190,13 @@ extern "C" __cdecl void *nvapi_QueryInterface(NvU32 id) {
     // unknown functions
     return nullptr;
   case 0x2926aaad:
-    return (void *)&NvAPI_SYS_GetDriverAndBranchVersion;
+    return (void *)&madeira_nv_SYS_GetDriverAndBranchVersion;
   case 0xf951a4d1:
-    return (void *)&NvAPI_GetDisplayDriverVersion;
+    return (void *)&madeira_nv_GetDisplayDriverVersion;
   case 0x01053fa5:
     return (void *)&NvAPI_GetInterfaceVersionString;
   case 0x4b708b54:
-    return (void *)&NvAPI_D3D_GetCurrentSLIState;
+    return (void *)&madeira_nv_trace<&dxmt::NvAPI_D3D_GetCurrentSLIState, 0x4b708b54u>::call;
   case 0xd22bdd7e:
     return (void *)&NvAPI_Unload;
   case 0x6c2d048c:
@@ -1048,47 +1212,47 @@ extern "C" __cdecl void *nvapi_QueryInterface(NvU32 id) {
   case 0x8e90bb9f:
     return (void *)&NvAPI_D3D11_SetNvShaderExtnSlot;
   case 0xae457190:
-    return (void *)&NvAPI_DISP_GetDisplayIdByDisplayName;
+    return (void *)&madeira_nv_DISP_GetDisplayIdByDisplayName;
   case 0xfceac864:
     return (void *)&NvAPI_D3D_GetObjectHandleForResource;
   case 0x6c0ed98c:
     return (void *)&NvAPI_D3D_SetResourceHint;
   case 0xe5ac921f:
-    return (void *)&NvAPI_EnumPhysicalGPUs;
+    return (void *)&madeira_nv_EnumPhysicalGPUs;
   case 0x48b3ea59:
-    return (void *)&NvAPI_EnumLogicalGPUs;
+    return (void *)&madeira_nv_trace<&dxmt::NvAPI_EnumLogicalGPUs, 0x48b3ea59u>::call;
   case 0x34ef9506:
-    return (void *)&NvAPI_GetPhysicalGPUsFromDisplay;
+    return (void *)&madeira_nv_trace<&dxmt::NvAPI_GetPhysicalGPUsFromDisplay, 0x34ef9506u>::call;
   case 0x351da224:
     return (void *)&NvAPI_Disp_HdrColorControl;
   case 0x84f2a8df:
-    return (void *)&NvAPI_Disp_GetHdrCapabilities;
+    return (void *)&madeira_nv_trace<&dxmt::NvAPI_Disp_GetHdrCapabilities, 0x84f2a8dfu>::call;
   case 0x3b05c7e1:
-    return (void *)&NvAPI_DISP_GetMonitorCapabilities;
+    return (void *)&madeira_nv_trace<&dxmt::NvAPI_DISP_GetMonitorCapabilities, 0x3b05c7e1u>::call;
   case 0x9abdd40d:
-    return (void *)&NvAPI_EnumNvidiaDisplayHandle;
+    return (void *)&madeira_nv_trace<&dxmt::NvAPI_EnumNvidiaDisplayHandle, 0x9abdd40du>::call;
   case 0x0078dba2:
-    return (void *)&NvAPI_GPU_GetConnectedDisplayIds;
+    return (void *)&madeira_nv_GPU_GetConnectedDisplayIds;
   case 0x1e9d8a31:
-    return (void *)&NvAPI_DISP_GetGDIPrimaryDisplayId;
+    return (void *)&madeira_nv_DISP_GetGDIPrimaryDisplayId;
   case 0xd8265d24:
-    return (void *)&NvAPI_GPU_GetArchInfo;
+    return (void *)&madeira_nv_trace<&dxmt::NvAPI_GPU_GetArchInfo, 0xd8265d24u>::call;
   case 0xdcb616c3:
-    return (void *)&NvAPI_GPU_GetAllClockFrequencies;
+    return (void *)&madeira_nv_trace<&dxmt::NvAPI_GPU_GetAllClockFrequencies, 0xdcb616c3u>::call;
   case 0xc7026a87:
-    return (void *)&NvAPI_GPU_GetGpuCoreCount;
+    return (void *)&madeira_nv_trace<&dxmt::NvAPI_GPU_GetGpuCoreCount, 0xc7026a87u>::call;
   case 0x1be0b8e5:
-    return (void *)&NvAPI_GPU_GetBusId;
+    return (void *)&madeira_nv_trace<&dxmt::NvAPI_GPU_GetBusId, 0x1be0b8e5u>::call;
   case 0x1bb18724:
-    return (void *)&NvAPI_GPU_GetBusType;
+    return (void *)&madeira_nv_trace<&dxmt::NvAPI_GPU_GetBusType, 0x1bb18724u>::call;
   case 0x07f9b368:
-    return (void *)&NvAPI_GPU_GetMemoryInfo;
+    return (void *)&madeira_nv_trace<&dxmt::NvAPI_GPU_GetMemoryInfo, 0x07f9b368u>::call;
   case 0xc0599498:
-    return (void *)&NvAPI_GPU_GetMemoryInfoEx;
+    return (void *)&madeira_nv_trace<&dxmt::NvAPI_GPU_GetMemoryInfoEx, 0xc0599498u>::call;
   case 0xceee8e9f:
-    return (void *)&NvAPI_GPU_GetFullName;
+    return (void *)&madeira_nv_GPU_GetFullName;
   case 0x6ff81213:
-    return (void *)&NvAPI_GPU_GetPstates20;
+    return (void *)&madeira_nv_trace<&dxmt::NvAPI_GPU_GetPstates20, 0x6ff81213u>::call;
   case 0xaef96ca1:
     return (void *)&NvAPI_D3D_GetSleepStatus;
   case 0xac1ca9e0:
@@ -1112,25 +1276,25 @@ extern "C" __cdecl void *nvapi_QueryInterface(NvU32 id) {
   case 0x375dbd6b:
     return (void *)&NvAPI_DRS_LoadSettings;
   case 0x0ff07fde:
-    return (void *)&NvAPI_GPU_GetAdapterIdFromPhysicalGpu;
+    return (void *)&madeira_nv_GPU_GetAdapterIdFromPhysicalGpu;
   case 0x842b066e:
-    return (void *)&NvAPI_GPU_GetLogicalGpuInfo;
+    return (void *)&madeira_nv_trace<&dxmt::NvAPI_GPU_GetLogicalGpuInfo, 0x842b066eu>::call;
   case 0xadd604d1:
-    return (void *)&NvAPI_GetLogicalGPUFromPhysicalGPU;
+    return (void *)&madeira_nv_trace<&dxmt::NvAPI_GetLogicalGPUFromPhysicalGPU, 0xadd604d1u>::call;
   case 0xaea3fa32:
-    return (void *)&NvAPI_GetPhysicalGPUsFromLogicalGPU;
+    return (void *)&madeira_nv_trace<&dxmt::NvAPI_GetPhysicalGPUsFromLogicalGPU, 0xaea3fa32u>::call;
   case 0x35c29134:
-    return (void *)&NvAPI_GetAssociatedNvidiaDisplayHandle;
+    return (void *)&madeira_nv_GetAssociatedNvidiaDisplayHandle;
   case 0xd995937e:
-    return (void *)&NvAPI_GetAssociatedDisplayOutputId;
+    return (void *)&madeira_nv_trace<&dxmt::NvAPI_GetAssociatedDisplayOutputId, 0xd995937eu>::call;
   case 0x2ddfb66e:
-    return (void *)&NvAPI_GPU_GetPCIIdentifiers;
+    return (void *)&madeira_nv_trace<&dxmt::NvAPI_GPU_GetPCIIdentifiers, 0x2ddfb66eu>::call;
   case 0xe3640a56:
-    return (void *)&NvAPI_GPU_GetThermalSettings;
+    return (void *)&madeira_nv_trace<&dxmt::NvAPI_GPU_GetThermalSettings, 0xe3640a56u>::call;
   case 0x46fbeb03:
-    return (void *)&NvAPI_GPU_GetPhysicalFrameBufferSize;
+    return (void *)&madeira_nv_trace<&dxmt::NvAPI_GPU_GetPhysicalFrameBufferSize, 0x46fbeb03u>::call;
   case 0x5a04b644:
-    return (void *)&NvAPI_GPU_GetVirtualFrameBufferSize;
+    return (void *)&madeira_nv_trace<&dxmt::NvAPI_GPU_GetVirtualFrameBufferSize, 0x5a04b644u>::call;
   default:
     break;
   }

@@ -3,6 +3,9 @@
 #include <cstring>   /* ml1251: std::memset in encodeBlitCommand */
 #include "Metal.hpp"
 #include "dxmt_buffer.hpp"
+#if defined(__i386__)  /* madeira-bcd: 32-bit (i386) builds only, as the fork shipped it */
+#include <cstring>
+#endif
 #include "dxmt_command.hpp"
 #include "dxmt_deptrack.hpp"
 #include "dxmt_occlusion_query.hpp"
@@ -175,6 +178,9 @@ struct RenderEncoderData : EncoderData {
   WMT::Buffer allocated_argbuf;
   uint64_t allocated_argbuf_offset;
   void *allocated_argbuf_mapping;
+#if defined(__i386__)  /* madeira-bcd: 32-bit (i386) builds only, as the fork shipped it */
+  uint64_t allocated_argbuf_gpu_address; /* madeira-bcd: short constant buffers */
+#endif
   uint8_t dsv_planar_flags;
   uint8_t dsv_readonly_flags;
   uint8_t render_target_count;
@@ -189,6 +195,9 @@ struct ComputeEncoderData : EncoderData {
   WMT::Buffer allocated_argbuf;
   uint64_t allocated_argbuf_offset;
   void *allocated_argbuf_mapping;
+#if defined(__i386__)  /* madeira-bcd: 32-bit (i386) builds only, as the fork shipped it */
+  uint64_t allocated_argbuf_gpu_address;
+#endif
 };
 
 struct BlitEncoderData : EncoderData {
@@ -470,6 +479,34 @@ public:
     ibuf_ = std::move(buffer);
   }
 
+#if defined(__i386__)  /* madeira-bcd: 32-bit (i386) builds only, as the fork shipped it */
+  /* madeira-bcd: realigned 16-bit indices -- copy [off, off+bytes) of the bound
+   * index buffer to the argument buffer at pad_off and point buf/off there.
+   * false (buf/off untouched) when the CPU copy is not the GPU's. */
+  bool
+  realignIndexRange(WMT::Buffer &buf, uint64_t &off, uint64_t pad_off, uint64_t bytes) {
+    auto [alloc, suboff] = access<true>(ibuf_, 0, ibuf_->length(), DXMT_ENCODER_RESOURCE_ACESS_READ);
+    (void)suboff;
+    /* The CPU mapping is the buffer's storage on iOS (unified memory; a
+     * GpuManaged buffer is CpuPlaced and Managed does not exist there). */
+    static unsigned copied, nomap, oob;
+    auto src = (const char *)alloc->mappedMemory(0);
+    if (!src || off + bytes > alloc->length()) {
+      unsigned n = !src ? ++nomap : ++oob;
+      if (n <= 4 || (n & 0xffff) == 0)
+        WARN("[idx-align] madeira-bcd encode: realign skipped (", !src ? "no CPU mapping" : "range past the buffer",
+             ", #", n, ")");
+      return false;
+    }
+    if (++copied <= 4 || (copied & 0xfffff) == 0)
+      WARN("[idx-align] madeira-bcd encode: realigned (#", copied, ", ", bytes, " bytes)");
+    memcpy(getMappedArgumentBuffer<char>(pad_off), src + off, bytes);
+    buf = getFinalArgumentBuffer();
+    off = getFinalArgumentBufferOffset(pad_off);
+    return true;
+  }
+
+#endif
   std::pair<WMT::Buffer, uint64_t>
   currentIndexBuffer() {
     // because of indirect draw, we can't predicate the accessed buffer range
@@ -491,8 +528,13 @@ public:
   template <PipelineStage stage, PipelineKind kind>
   void encodeConstantBuffers(
       const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
+#if defined(__i386__)  /* madeira-bcd: 32-bit (i386) builds only, as the fork shipped it */
+      uint64_t argument_buffer_offset, const uint32_t *short_cb = nullptr
+  ); /* madeira-bcd: short constant buffers -- short_cb[2*slot] = argbuf offset + 1, [2*slot+1] = bytes */
+#else
       uint64_t argument_buffer_offset
   );
+#endif
   template <PipelineStage stage, PipelineKind kind>
   void encodeShaderResources(
       const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments,
@@ -768,6 +810,16 @@ public:
     );
   }
 
+#if defined(__i386__)  /* madeira-bcd: 32-bit (i386) builds only, as the fork shipped it */
+  template <bool ComputeCommandEncoder = false>
+  uint64_t
+  getArgumentBufferGpuAddress(size_t offset) {
+    if constexpr (ComputeCommandEncoder)
+      return reinterpret_cast<ComputeEncoderData *>(encoder_current)->allocated_argbuf_gpu_address + offset;
+    return reinterpret_cast<RenderEncoderData *>(encoder_current)->allocated_argbuf_gpu_address + offset;
+  }
+
+#endif
   template <bool ComputeCommandEncoder = false>
   uint64_t
   getFinalArgumentBufferOffset(size_t offset) {

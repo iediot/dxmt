@@ -8,6 +8,57 @@
 #include "log/log.hpp"
 #include "sha1/sha1_util.hpp"
 #include "../d3d10/d3d10_shader.hpp"
+#if defined(__i386__)  /* madeira-bcd: 32-bit (i386) builds only, as the fork shipped it */
+#include <cstring>
+
+/* madeira-bcd: short constant buffers -- read dcl_constantbuffer cbN[size]
+ * from the SHDR/SHEX chunk. SM4/5 only (2D cb operand, immediate indices). */
+static void
+madeira_parse_cb_sizes(const void *pBytecode, uint32_t BytecodeLength, uint16_t out[14]) {
+  for (unsigned i = 0; i < 14; i++)
+    out[i] = 0;
+  const uint8_t *b = (const uint8_t *)pBytecode;
+  if (!b || BytecodeLength < 32 || memcmp(b, "DXBC", 4))
+    return;
+  uint32_t count;
+  memcpy(&count, b + 28, 4);
+  if (count > 64 || 32 + 4ull * count > BytecodeLength)
+    return;
+  for (uint32_t c = 0; c < count; c++) {
+    uint32_t off;
+    memcpy(&off, b + 32 + 4 * c, 4);
+    if (off + 8ull > BytecodeLength)
+      continue;
+    if (memcmp(b + off, "SHDR", 4) && memcmp(b + off, "SHEX", 4))
+      continue;
+    uint32_t size;
+    memcpy(&size, b + off + 4, 4);
+    if (off + 8ull + size > BytecodeLength || size < 8)
+      return;
+    const uint32_t *t = (const uint32_t *)(b + off + 8);
+    uint32_t n = size / 4, len = t[1] < n ? t[1] : n;
+    for (uint32_t i = 2; i < len;) {
+      uint32_t tok = t[i], op = tok & 0x7ff;
+      uint32_t ilen = op == 0x35 /* customdata */ ? (i + 1 < len ? t[i + 1] : 0) : (tok >> 24) & 0x7f;
+      if (!ilen || i + ilen > len)
+        return;
+      if (op == 0x59 /* dcl_constantbuffer */ && ilen >= 4) {
+        uint32_t opnd = t[i + 1], k = i + 2;
+        if (opnd & 0x80000000u)
+          k++; /* extended operand */
+        uint32_t dim = (opnd >> 20) & 3, r0 = (opnd >> 22) & 7, r1 = (opnd >> 25) & 7;
+        if (dim == 2 && r0 == 0 && r1 == 0 && k + 1 < i + ilen) {
+          uint32_t slot = t[k], vec4 = t[k + 1];
+          if (slot < 14)
+            out[slot] = vec4 > 4096 ? 4096 : (uint16_t)vec4;
+        }
+      }
+      i += ilen;
+    }
+    return;
+  }
+}
+#endif
 #include "../d3d10/d3d10_input_layout.hpp"
 #include <cstring>
 #include <shared_mutex>
@@ -73,6 +124,9 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
     Sha1Digest sha1_;
     MTL_SHADER_REFLECTION reflection_;
     MTL_SM50_SHADER_ARGUMENT *arguments_info_buffer;
+#if defined(__i386__)  /* madeira-bcd: 32-bit (i386) builds only, as the fork shipped it */
+    uint16_t cb_vec4_[14] = {}; /* madeira-bcd: short constant buffers */
+#endif
     std::unordered_map<ShaderVariant, std::unique_ptr<CompiledShader>> variants;
 
   public:
@@ -109,6 +163,10 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
     virtual MTL_SM50_SHADER_ARGUMENT *constant_buffers_info() {
       return arguments_info_buffer;
     };
+#if defined(__i386__)  /* madeira-bcd: 32-bit (i386) builds only, as the fork shipped it */
+    virtual const uint16_t *cb_declared_vec4() { return cb_vec4_; }
+    void set_cb_declared(const void *code, uint32_t len) { madeira_parse_cb_sizes(code, len, cb_vec4_); }
+#endif
     virtual MTL_SM50_SHADER_ARGUMENT *arguments_info() {
       return arguments_info_buffer + reflection_.NumConstantBuffers;
     };
@@ -236,6 +294,9 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
       return nullptr;
     }
     auto shader = std::make_unique<CachedSM50Shader>(this, sm50, sha1, reflection);
+#if defined(__i386__)  /* madeira-bcd: 32-bit (i386) builds only, as the fork shipped it */
+    shader->set_cb_declared(pBytecode, BytecodeLength);
+#endif
     {
       std::unique_lock<std::shared_mutex> lock(mutex_shares);
       auto result = shaders_.find(sha1);

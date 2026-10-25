@@ -30,6 +30,55 @@ constexpr size_t kStagingBlockSize = 0x2000000; // 32MB
 constexpr size_t kStagingBlockSizeForDeferredContext = 0x200000; // 2MB
 constexpr size_t kStagingBlockLifetime = 300;
 
+/* madeira-bcd: small staging rings (tools/patch-d3d11-src-small-rings.py).
+ * DXMT_SMALL_RINGS = <program>;<program> (or 1 / * for every program) gives
+ * every ring whose blocks are larger than 4 MB -- the command queue's staging
+ * and copy-temp rings, the resource initializer's upload heap -- 4 MB blocks
+ * in the named programs. A ring keeps a block until 300 later submissions and
+ * an idle device keeps it for good: the Rockstar Games Launcher held 132 MB of
+ * 32 MB blocks and Social Club's CEF 68 MB through a whole RDR2 session
+ * (2026-10-09 13:09). An upload larger than a block still gets a block of its
+ * own. Unset, empty or 0: BlockSize as upstream. Read once per process. */
+constexpr size_t kMadeiraSmallRingBlockSize = 0x400000; // 4MB
+
+inline bool
+madeiraSmallRingsHere() {
+  static const bool here = [] {
+    const std::string list = env::getEnvVar("DXMT_SMALL_RINGS");
+    if (list.empty() || list == "0")
+      return false;
+    auto lower = [](std::string s) {
+      for (auto &c : s)
+        if (c >= 'A' && c <= 'Z')
+          c += 'a' - 'A';
+      return s;
+    };
+    const std::string exe = env::getExeName();
+    const std::string want = lower(exe);
+    bool hit = false;
+    for (size_t i = 0; !hit && i <= list.size();) {
+      size_t j = list.find_first_of(";,", i);
+      if (j == std::string::npos)
+        j = list.size();
+      std::string item = list.substr(i, j - i);
+      const size_t a = item.find_first_not_of(" \t");
+      item = a == std::string::npos ? std::string() : item.substr(a, item.find_last_not_of(" \t") - a + 1);
+      hit = item == "1" || item == "*" || (!item.empty() && lower(item) == want);
+      i = j + 1;
+    }
+    if (hit)
+      WARN("[small-rings] madeira-bcd: ", exe, " uses ", kMadeiraSmallRingBlockSize >> 20,
+           " MB staging and upload ring blocks (DXMT_SMALL_RINGS)");
+    return hit;
+  }();
+  return here;
+}
+
+inline size_t
+madeiraRingBlockSize(size_t natural) {
+  return natural > kMadeiraSmallRingBlockSize && madeiraSmallRingsHere() ? kMadeiraSmallRingBlockSize : natural;
+}
+
 // DXMT_RING_OVERSIZE_REUSE is a Madeira switch (util_madeira_switch.hpp): on
 // by default only in the i386 build. Every 64-bit build keeps the upstream
 // block lifetime unless it is set.
@@ -49,6 +98,13 @@ template <typename Allocator, size_t BlockSize = kStagingBlockSize, class mutex 
 public:
 
   static constexpr size_t block_size = BlockSize;
+
+  /* madeira-bcd: small staging rings -- BlockSize, or 4 MB for a larger
+   * ring in a program DXMT_SMALL_RINGS names (madeiraRingBlockSize). */
+  static size_t
+  ring_block_size() {
+    return madeiraRingBlockSize(BlockSize);
+  }
 
   // single_writer engages a DXMT_DEBUG only assertion that every allocate()
   // and seal_latest() runs on one fixed thread. Set it only for a ring whose
@@ -78,10 +134,10 @@ public:
     for (unsigned i = 0; i < count; ++i) {
       fifo.push({
           .allocated_size = 0,
-          .total_size = BlockSize,
+          .total_size = ring_block_size(),
           .last_used_seq_id = 0,
           .inc_time_to_live = 0,
-          .block = allocator_.allocate(BlockSize),
+          .block = allocator_.allocate(ring_block_size()),
       });
     }
   }
@@ -345,7 +401,7 @@ RingBumpState<Allocator, BlockSize, mutex>::allocate(
   }
   return suballocate(
       allocate_or_reuse_block(
-          seq_id, coherent_id, std::max(size, BlockSize) // in case required size is larger than block size
+          seq_id, coherent_id, std::max(size, ring_block_size()) // in case required size is larger than block size
       ),
       size, alignment
   );
@@ -361,7 +417,7 @@ RingBumpState<Allocator, BlockSize, mutex>::free_blocks(uint64_t coherent_id) {
       break;
     auto expired = (coherent_id - front.last_used_seq_id) > kStagingBlockLifetime ||
                    front.inc_time_to_live > kStagingBlockLifetime || coherent_id == -1ull;
-    auto adhoc = front.total_size != BlockSize && !front.reusable_oversize;
+    auto adhoc = front.total_size != ring_block_size() && !front.reusable_oversize;
     if (expired || adhoc) {
       // can be deallocated
       if (front.reusable_oversize) --reusable_oversize_blocks_;
@@ -388,7 +444,7 @@ RingBumpState<Allocator, BlockSize, mutex>::allocate_or_reuse_block(
         fifo.pop();
         continue;
       }
-      if (front.total_size != BlockSize && !front.reusable_oversize) {
+      if (front.total_size != ring_block_size() && !front.reusable_oversize) {
         fifo.pop();
         continue;
       } else if (front.total_size >= block_size) {
@@ -408,7 +464,7 @@ RingBumpState<Allocator, BlockSize, mutex>::allocate_or_reuse_block(
   // Repeated image uploads just above the normal block size otherwise create
   // and destroy a Metal buffer every frame. Retain at most two modest oversize
   // blocks per ring, with the same completion checks and expiry as normal ones.
-  const bool reusable_oversize = ringOversizeReuseEnabled() && block_size > BlockSize &&
+  const bool reusable_oversize = ringOversizeReuseEnabled() && block_size > ring_block_size() &&
       block_size <= 16u * 1024u * 1024u && reusable_oversize_blocks_ < 2;
   if (reusable_oversize) ++reusable_oversize_blocks_;
   fifo.push({

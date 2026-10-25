@@ -859,6 +859,21 @@ _MTLDevice_newSamplerState(void *obj) {
   sampler_desc.lodAverage = info->lod_average;
   sampler_desc.normalizedCoordinates = info->normalized_coords;
   sampler_desc.supportArgumentBuffers = info->support_argument_buffers;
+  { /* madeira-bcd: native sampler reduction (tools/patch-winemetal-sampler-reduction.py) */
+    static int on = -1, said;
+    uint8_t tag = ((const uint8_t *)info)[__builtin_offsetof(struct WMTSamplerInfo, support_argument_buffers) + 1];
+    if (on < 0) on = madeira_cfg_int("sampler-reduction", 0) == 3;
+    if (on && (tag == 0xA1 || tag == 0xA2)) {
+      SEL sel = sel_registerName("setReductionMode:");
+      int ok = [device supportsFamily:(MTLGPUFamily)1010] && [sampler_desc respondsToSelector:sel];
+      if (ok) ((void (*)(id, SEL, NSUInteger))objc_msgSend)(sampler_desc, sel, (NSUInteger)(tag & 3));
+      if (said++ < 6)
+        fprintf(stderr, "[sampler-reduction] madeira-bcd %s sampler: %s (min %lu mag %lu mip %lu)\n",
+                tag == 0xA1 ? "MINIMUM" : "MAXIMUM",
+                ok ? "Metal reductionMode set" : "this device has no Metal reduction (needs an Apple10 GPU and iOS 26) -- averaging",
+                (unsigned long)info->min_filter, (unsigned long)info->mag_filter, (unsigned long)info->mip_filter);
+    }
+  }
 
   id<MTLSamplerState> sampler = [device newSamplerStateWithDescriptor:sampler_desc];
   info->gpu_resource_id = info->support_argument_buffers ? [sampler gpuResourceID]._impl : 0;
@@ -1443,6 +1458,16 @@ _MTLCommandBuffer_computeCommandEncoder(void *obj) {
   return STATUS_SUCCESS;
 }
 
+/* madeira-bcd: rp-lean (tools/patch-winemetal-rp-lean.py). A render pass fills
+ * only the colour attachments it uses: a slot with no texture and no resolve
+ * texture is not part of the pass in Metal, and a fresh descriptor's slot has
+ * none. madeira.cfg rp-lean = 0 fills all eight as before. */
+static int madeira_rp_lean_on(void) {
+  static int on = -1;
+  if (on < 0) on = madeira_cfg_int("rp-lean", 1) ? 1 : 0;
+  return on;
+}
+
 static NTSTATUS
 _MTLCommandBuffer_renderCommandEncoder(void *obj) {
   struct unixcall_generic_obj_uint64_obj_ret *params = obj;
@@ -1464,7 +1489,28 @@ _MTLCommandBuffer_renderCommandEncoder(void *obj) {
     return STATUS_SUCCESS;
   }
   MTLRenderPassDescriptor *descriptor = [[MTLRenderPassDescriptor alloc] init];
+  const int madeira_lean = madeira_rp_lean_on();   /* madeira-bcd: rp-lean */
   for (unsigned i = 0; i < 8; i++) {
+    if (madeira_lean) {   /* madeira-bcd: rp-lean -- the slots the pass uses, one lookup each */
+      if (!info->colors[i].texture && !info->colors[i].resolve_texture)
+        continue;
+      MTLRenderPassColorAttachmentDescriptor *madeira_att = descriptor.colorAttachments[i];
+      madeira_att.clearColor = MTLClearColorMake(
+          info->colors[i].clear_color.r, info->colors[i].clear_color.g, info->colors[i].clear_color.b,
+          info->colors[i].clear_color.a
+      );
+      madeira_att.level = info->colors[i].level;
+      madeira_att.slice = info->colors[i].slice;
+      madeira_att.depthPlane = info->colors[i].depth_plane;
+      madeira_att.texture = (id<MTLTexture>)info->colors[i].texture;
+      madeira_att.loadAction = (MTLLoadAction)info->colors[i].load_action;
+      madeira_att.storeAction = (MTLStoreAction)info->colors[i].store_action;
+      madeira_att.resolveTexture = (id<MTLTexture>)info->colors[i].resolve_texture;
+      madeira_att.resolveLevel = info->colors[i].resolve_level;
+      madeira_att.resolveSlice = info->colors[i].resolve_slice;
+      madeira_att.resolveDepthPlane = info->colors[i].resolve_depth_plane;
+      continue;
+    }
     descriptor.colorAttachments[i].clearColor = MTLClearColorMake(
         info->colors[i].clear_color.r, info->colors[i].clear_color.g, info->colors[i].clear_color.b,
         info->colors[i].clear_color.a
@@ -1762,6 +1808,52 @@ _MTLDevice_newRenderPipelineStateVD(void *obj) {
   return STATUS_SUCCESS;
 }
 
+/* madeira-bcd: empty fragment function (tools/patch-winemetal-null-fragment.py).
+ * Metal ABORTS on a mesh pipeline with rasterization on and no fragment
+ * function; D3D allows a pipeline with no pixel shader (Horizon Zero Dawn's
+ * VS + GS pipelines killed its pipeline thread, build 469). Such a pipeline
+ * gets an empty fragment function and no colour writes; gs-null-fragment = 0
+ * refuses it instead. Returns 0 when the pipeline must be refused. */
+static id<MTLLibrary> madeira_null_fs_lib;   /* kept for the process, like the function */
+static id<MTLFunction> madeira_null_fs_fn;
+static id<MTLDevice> madeira_null_fs_dev;
+
+static id<MTLFunction> madeira_null_fs_get(id<MTLDevice> dev) {
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    NSError *e = nil;
+    madeira_null_fs_lib = [dev newLibraryWithSource:@"fragment void madeira_null_fragment() {}" options:nil error:&e];
+    madeira_null_fs_fn = madeira_null_fs_lib ? [madeira_null_fs_lib newFunctionWithName:@"madeira_null_fragment"] : nil;
+    madeira_null_fs_dev = dev;
+    if (!madeira_null_fs_fn)
+      fprintf(stderr, "[null-fs] madeira-bcd empty fragment function could not be compiled: %s\n",
+              e ? [[e localizedDescription] UTF8String] : "?");
+  });
+  return madeira_null_fs_dev == dev ? madeira_null_fs_fn : nil;
+}
+
+static int madeira_null_fs_fix(id<MTLDevice> dev, MTLMeshRenderPipelineDescriptor *d, const char *who) {
+  static long long on = -1;
+  static unsigned said;
+  id<MTLFunction> f;
+  if (d.fragmentFunction || !d.rasterizationEnabled) return 1;
+  if (on < 0) on = madeira_cfg_int("gs-null-fragment", 1) ? 1 : 0;
+  f = on ? madeira_null_fs_get(dev) : nil;
+  if (!f) {
+    if (said++ < 8)
+      fprintf(stderr, "[null-fs] madeira-bcd %s pipeline with no pixel shader REFUSED (%s)\n", who,
+              on ? "no empty fragment function" : "gs-null-fragment = 0");
+    return 0;
+  }
+  d.fragmentFunction = f;
+  for (unsigned c = 0; c < 8; c++) d.colorAttachments[c].writeMask = MTLColorWriteMaskNone;
+  d.alphaToCoverageEnabled = NO;
+  if (said++ < 8)
+    fprintf(stderr, "[null-fs] madeira-bcd %s pipeline with no pixel shader: empty fragment function, "
+                    "no colour writes (gs-null-fragment = 0 refuses it)\n", who);
+  return 1;
+}
+
 static NTSTATUS
 _MTLDevice_newMeshRenderPipelineState(void *obj) {
   struct unixcall_mtldevice_newmeshrenderpso *params = obj;
@@ -1834,6 +1926,12 @@ _MTLDevice_newMeshRenderPipelineState(void *obj) {
     options = info->fail_on_binary_archive_miss ? MTLPipelineOptionFailOnBinaryArchiveMiss : MTLPipelineOptionNone;
   }
 #endif
+  if (!madeira_null_fs_fix((id<MTLDevice>)params->device, descriptor, "mesh")) {   /* madeira-bcd */
+    params->ret_pso = 0;
+    params->ret_error = 0;
+    [descriptor release];
+    return STATUS_SUCCESS;
+  }
   NSError *err = NULL;
   params->ret_pso = (obj_handle_t)[(id<MTLDevice>)params->device newRenderPipelineStateWithMeshDescriptor:descriptor
                                                                                                   options:options
@@ -2647,6 +2745,9 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     case WMTRenderCommandDrawMeshThreadgroupsIndirect: {
       struct wmtcmd_render_draw_meshthreadgroups_indirect *body =
           (struct wmtcmd_render_draw_meshthreadgroups_indirect *)next;
+      /* madeira-bcd: DXIL tessellation, indirect (same marker as the direct draw) */
+      if (body->reserved[1] == 0x7e55 && body->reserved[0])
+        [encoder setObjectThreadgroupMemoryLength:body->reserved[0] atIndex:0];
       [encoder drawMeshThreadgroupsWithIndirectBuffer:(id<MTLBuffer>)body->indirect_args_buffer
                                  indirectBufferOffset:body->indirect_args_offset
                           threadsPerObjectThreadgroup:MTLSizeMake(
@@ -3398,6 +3499,12 @@ _MTLCommandBuffer_presentDrawable(void *obj) {
     return STATUS_SUCCESS;
   }
   int mode = g_madeira_vsync_mode;
+  {   /* madeira-bcd fps-gov (tools/patch-winemetal-fps-cap.py): the governor's frame cap, opt-in */
+    extern unsigned long long ios_fps_cap_dxmt_pace(void);
+    unsigned long long fps_cap_ns = ios_fps_cap_dxmt_pace();
+    if (fps_cap_ns)
+      ios_frame_limiter(fps_cap_ns);
+  }
   /* ml1050: this call IS the frame boundary on the encode thread. */
   if (madeira_frame_hooks_on())
     ios_frame_encode_present(0);
@@ -3804,8 +3911,18 @@ _MetalLayer_nextDrawable(void *obj) {
   if (ms > 50.0) {
     uint64_t s = atomic_fetch_add_explicit(&nd_slow, 1, memory_order_relaxed) + 1;
     if (s <= 16 || (s % 64) == 0)
-      dprintf(STDERR_FILENO, "[iOS DXMT] nextDrawable #%llu BLOCKED %.0fms (nil=%d slow_total=%llu)\n",
-              (unsigned long long)n, ms, params->ret == 0, (unsigned long long)s);
+    {
+      uint64_t owner = 0, native_tid = 0;
+#if TARGET_OS_IOS
+      extern uint64_t ios_perf_caller_ids(void);
+      owner = ios_perf_caller_ids();
+      pthread_threadid_np(NULL, &native_tid);
+#endif
+      dprintf(STDERR_FILENO, "[iOS DXMT] nextDrawable #%llu BLOCKED %.0fms (nil=%d slow_total=%llu) layer=%p wine_pid=%04x wine_tid=%04x native_tid=%llu frame_hook=%d\n",
+              (unsigned long long)n, ms, params->ret == 0, (unsigned long long)s,
+              (void *)params->handle, (unsigned)(owner >> 32), (unsigned)owner,
+              (unsigned long long)native_tid, madeira_frame_hooks_on());
+    }
   } else if (n <= 8) {
     dprintf(STDERR_FILENO, "[iOS DXMT] nextDrawable #%llu took %.2fms\n", (unsigned long long)n, ms);
   }
@@ -6458,6 +6575,195 @@ void madeira_set_fence_mode(int mode) {
   fprintf(stderr, "[fence-mode] ml1136 UI requested fence-chain %d\n", mode);
 }
 #include "pipeline_warm.h"
+
+/* madeira-bcd: native file access for the D3D12 shader cache (tools/patch-winemetal-sc-native.py).
+ * madeira-d3d12's cache entries, %LOCALAPPDATA%\Madeira\ShaderCache\<build>\<bb>\<key>.msc,
+ * read and written here relative to an open descriptor of the build directory
+ * instead of through Wine's file API (three wineserver requests and a server
+ * realpath() per entry). The same files, names and contents. MadeiraCtl ops
+ * 20 (open), 21 (get) and 22 (put); see the script. */
+#include <pthread.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <time.h>
+
+/* One get or put; madeira_d3d12.c (struct mad_scn_io) has the same layout. */
+struct madeira_scn_io {
+  uint64_t key[2];   /* the entry's key: file <key[0] >> 56 as %02x>/<key[0]><key[1] as %016llx>.msc */
+  uint64_t data;     /* get: where the entry goes; put: the entry */
+  uint64_t cap;      /* get: room at data (0: only whether the entry is there) */
+  uint64_t len;      /* get: the entry's length (out); put: its length */
+  uint32_t handle;   /* from op 20 */
+  uint32_t flags;    /* 0 */
+};
+#define MADEIRA_SCN_MAX 8
+#define MADEIRA_SCN_MAX_LEN (256ull << 20)   /* madeira_d3d12.c mad_sc_read_file's limit */
+
+static struct { char dir[1024]; int fd; } madeira_scn_tab[MADEIRA_SCN_MAX];
+static unsigned madeira_scn_n;
+static pthread_mutex_t madeira_scn_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t madeira_scn_nonce;   /* set at the first open, under the lock: this run's temporary names */
+static _Atomic uint64_t madeira_scn_seq, madeira_scn_again;
+static _Atomic uint32_t madeira_scn_errors;
+
+static uint32_t madeira_scn_open(const char *dir) {
+  uint32_t h = 0;
+  unsigned i;
+  if (!dir || !*dir || strlen(dir) >= sizeof madeira_scn_tab[0].dir) return 0;
+  pthread_mutex_lock(&madeira_scn_mu);
+  if (!madeira_scn_nonce) madeira_scn_nonce = (uint32_t)time(NULL) | 1u;   /* differs from an earlier run's leftovers */
+  for (i = 0; i < madeira_scn_n && !h; i++)
+    if (!strcmp(madeira_scn_tab[i].dir, dir)) h = i + 1;
+  if (!h && madeira_scn_n < MADEIRA_SCN_MAX) {
+    int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd >= 0) {
+      snprintf(madeira_scn_tab[madeira_scn_n].dir, sizeof madeira_scn_tab[0].dir, "%s", dir);
+      madeira_scn_tab[madeira_scn_n].fd = fd;
+      h = ++madeira_scn_n;
+    } else
+      fprintf(stderr, "[sc-native] madeira-bcd cannot open the shader cache directory (errno %d); "
+                      "madeira-d3d12 keeps Wine's file calls\n", errno);
+  }
+  pthread_mutex_unlock(&madeira_scn_mu);
+  return h;
+}
+
+/* A handle's directory descriptor, -1 for none; entries never change once made. */
+static int madeira_scn_dirfd(uint32_t h) {
+  int fd = -1;
+  pthread_mutex_lock(&madeira_scn_mu);
+  if (h >= 1 && h <= madeira_scn_n) fd = madeira_scn_tab[h - 1].fd;
+  pthread_mutex_unlock(&madeira_scn_mu);
+  return fd;
+}
+
+/* "<bb>/<key[0]><key[1]>.msc", as madeira_d3d12.c mad_sc_path names it. */
+static void madeira_scn_name(const uint64_t key[2], char out[64]) {
+  snprintf(out, 64, "%02x/%016llx%016llx.msc", (unsigned)(key[0] >> 56),
+           (unsigned long long)key[0], (unsigned long long)key[1]);
+}
+
+static void madeira_scn_error(const char *what, int e) {
+  uint32_t n = atomic_fetch_add_explicit(&madeira_scn_errors, 1, memory_order_relaxed) + 1;
+  if (n <= 8)
+    fprintf(stderr, "[sc-native] madeira-bcd shader cache %s failed natively (errno %d); "
+                    "that entry goes through Wine's file calls\n", what, e);
+}
+
+static uint32_t madeira_scn_get(struct madeira_scn_io *io) {
+  char name[64];
+  struct stat st;
+  unsigned char *b = (unsigned char *)(uintptr_t)io->data;
+  uint64_t off = 0;
+  int dfd = madeira_scn_dirfd(io->handle), fd;
+  if (dfd < 0) return 3;
+  madeira_scn_name(io->key, name);
+  if (!io->cap) {   /* is it there? (as GetFileAttributesW answers: anything by that name) */
+    if (fstatat(dfd, name, &st, 0) != 0) {
+      if (errno == ENOENT || errno == ENOTDIR) return 0;
+      madeira_scn_error("lookup", errno);
+      return 3;
+    }
+    io->len = (uint64_t)st.st_size;
+    return 2;
+  }
+  fd = openat(dfd, name, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    if (errno == ENOENT || errno == ENOTDIR) return 0;
+    madeira_scn_error("read", errno);
+    return 3;
+  }
+  /* Not a regular file, or past the reader's limit: the caller's Wine path decides, as before. */
+  if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 || (uint64_t)st.st_size > MADEIRA_SCN_MAX_LEN) {
+    close(fd);
+    return 3;
+  }
+  io->len = (uint64_t)st.st_size;
+  if (io->len > io->cap || !b) { close(fd); return 2; }
+  while (off < io->len) {
+    ssize_t r = pread(fd, b + off, (size_t)(io->len - off), (off_t)off);
+    if (r < 0 && errno == EINTR) continue;
+    if (r <= 0) break;
+    off += (uint64_t)r;
+  }
+  close(fd);
+  return off == io->len ? 1u : 3u;
+}
+
+static uint32_t madeira_scn_put(const struct madeira_scn_io *io) {
+  char name[64], tmp[96], bucket[4];
+  const unsigned char *b = (const unsigned char *)(uintptr_t)io->data;
+  uint64_t off = 0;
+  int dfd = madeira_scn_dirfd(io->handle), fd = -1, tries, ok = 1;
+  if (dfd < 0 || !b || !io->len || io->len > MADEIRA_SCN_MAX_LEN) return 0;
+  madeira_scn_name(io->key, name);
+  for (tries = 0; fd < 0 && tries < 4; tries++) {
+    snprintf(tmp, sizeof tmp, "%s.%08x%llx.tmp", name, madeira_scn_nonce,
+             (unsigned long long)atomic_fetch_add_explicit(&madeira_scn_seq, 1, memory_order_relaxed));
+    fd = openat(dfd, tmp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0666);
+    if (fd < 0 && errno == ENOENT) {   /* no bucket directory yet: made as Wine's CreateDirectoryW makes it */
+      snprintf(bucket, sizeof bucket, "%02x", (unsigned)(io->key[0] >> 56));
+      if (mkdirat(dfd, bucket, 0777) == 0 || errno == EEXIST)
+        fd = openat(dfd, tmp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0666);
+    }
+    if (fd < 0 && errno != EEXIST) break;
+  }
+  if (fd < 0) { madeira_scn_error("write", errno); return 0; }
+  while (off < io->len) {
+    ssize_t w = pwrite(fd, b + off, (size_t)(io->len - off), (off_t)off);
+    if (w < 0 && errno == EINTR) continue;
+    if (w <= 0) { ok = 0; break; }
+    off += (uint64_t)w;
+  }
+  if (close(fd) != 0) ok = 0;
+  if (ok) {
+    /* A count only: an entry already there was converted twice, by two threads
+     * that missed the same key at once (or an earlier run's file is replaced). */
+    struct stat st;
+    int again = fstatat(dfd, name, &st, 0) == 0;
+    if (renameat(dfd, tmp, dfd, name) == 0) {
+      if (again) {
+        uint64_t n = atomic_fetch_add_explicit(&madeira_scn_again, 1, memory_order_relaxed) + 1;
+        if (n == 1 || n == 10 || n == 100 || n % 1000 == 0)
+          fprintf(stderr, "[sc-native] madeira-bcd %llu shader-cache entries were already there when stored "
+                          "(converted twice, e.g. by two threads at once)\n", (unsigned long long)n);
+      }
+      return 1;
+    }
+  }
+  madeira_scn_error("write", errno);
+  unlinkat(dfd, tmp, 0);
+  return 0;
+}
+
+static uint32_t madeira_scn_ctl(struct madeira_ctl_args *a) {
+  struct madeira_scn_io *io = (struct madeira_scn_io *)(uintptr_t)a->ptr;
+  switch (a->op) {
+  case 20: return madeira_scn_open((const char *)(uintptr_t)a->ptr);
+  case 21: return io ? madeira_scn_get(io) : 3;
+  case 22: return io ? madeira_scn_put(io) : 0;
+  default: return 0;
+  }
+}
+
+/* madeira-bcd: late render-pass store actions (tools/patch-winemetal-rp-store.py).
+ * MadeiraCtl op 24 from madeira-d3d12 (rp-discard = 1): the store actions of an
+ * open render encoder whose pass said MTLStoreActionUnknown, set before
+ * endEncoding; 0xff leaves one alone, encoder 0 is a probe. */
+struct madeira_rp_store_req { uint64_t enc; uint8_t color[8], depth, stencil, pad[6]; };
+static uint32_t madeira_rp_store(const struct madeira_rp_store_req *r) {
+  id<MTLRenderCommandEncoder> enc;
+  unsigned i;
+  if (!r->enc) return 1;
+  enc = (id<MTLRenderCommandEncoder>)(uintptr_t)r->enc;
+  for (i = 0; i < 8; i++)
+    if (r->color[i] != 0xff) [enc setColorStoreAction:(MTLStoreAction)r->color[i] atIndex:i];
+  if (r->depth != 0xff) [enc setDepthStoreAction:(MTLStoreAction)r->depth];
+  if (r->stencil != 0xff) [enc setStencilStoreAction:(MTLStoreAction)r->stencil];
+  return 1;
+}
+
 static NTSTATUS _madeira_ctl(void *args) {
   struct madeira_ctl_args *a = args;
   if (!a) return STATUS_SUCCESS;
@@ -6534,6 +6840,65 @@ static NTSTATUS _madeira_ctl(void *args) {
     a->ret = 1;
     break;
   }
+  case 8: {   /* madeira-bcd: GPU fault attribution (tools/patch-dxmt-gpu-fault-info.py) */
+    MTLCommandBufferDescriptor *desc;
+    id<MTLCommandBuffer> cb;
+    if (wmtr_enabled() || !a->ptr) break;
+    desc = [MTLCommandBufferDescriptor new];
+    desc.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
+    cb = [(id<MTLCommandQueue>)(uintptr_t)a->ptr commandBufferWithDescriptor:desc];
+    [desc release];
+    a->len = (uint64_t)(uintptr_t)cb;
+    a->ret = cb ? 1u : 0u;
+    break;
+  }
+  case 9: {   /* madeira-bcd: which encoders of a failed command buffer faulted */
+    struct { uint64_t cb, buf, size; } *t = (void *)(uintptr_t)a->ptr;
+    char *out; size_t cap, n = 0;
+    unsigned completed = 0, pending = 0;
+    if (wmtr_enabled() || !t || !t->cb || !t->buf || t->size < 64) break;
+    out = (char *)(uintptr_t)t->buf; cap = (size_t)t->size; out[0] = 0;
+    @autoreleasepool {
+      NSError *err = [(id<MTLCommandBuffer>)(uintptr_t)t->cb error];
+      NSArray *infos = err ? err.userInfo[MTLCommandBufferEncoderInfoErrorKey] : nil;
+      if (err) {   /* the MTLCommandBufferError code: 3 timeout, 4 page fault, ... */
+        int w0 = snprintf(out, cap, "code %ld (%s): ", (long)err.code, err.domain.UTF8String ? err.domain.UTF8String : "?");
+        if (w0 > 0 && (size_t)w0 < cap) n = (size_t)w0;
+      }
+      for (int pass = 0; pass < 2; pass++) {
+        for (id<MTLCommandBufferEncoderInfo> info in infos) {
+          MTLCommandEncoderErrorState st = info.errorState;
+          const char *sn;
+          int w;
+          if (pass == 0) {
+            if (st == MTLCommandEncoderErrorStateCompleted) completed++;
+            if (st == MTLCommandEncoderErrorStatePending) pending++;
+            if (st != MTLCommandEncoderErrorStateFaulted) continue;
+            sn = "FAULTED";
+          } else {
+            if (st == MTLCommandEncoderErrorStateAffected) sn = "affected";
+            else if (st == MTLCommandEncoderErrorStateUnknown) sn = "unknown";
+            else continue;
+          }
+          if (n + 32 >= cap) break;
+          w = snprintf(out + n, cap - n, "%s[%s] %s", (n && out[n - 2] != ':') ? "; " : "", sn,
+                       info.label.length ? info.label.UTF8String : "(no label)");
+          if (w < 0 || (size_t)w >= cap - n) { n = cap - 1; break; }
+          n += (size_t)w;
+          for (NSString *sp in info.debugSignposts) {
+            w = snprintf(out + n, cap - n, " {%s}", sp.UTF8String);
+            if (w < 0 || (size_t)w >= cap - n) { n = cap - 1; break; }
+            n += (size_t)w;
+          }
+        }
+      }
+      if (n + 48 < cap)
+        snprintf(out + n, cap - n, "%s(%u completed, %u pending, %u encoders)", n ? "; " : "",
+                 completed, pending, (unsigned)infos.count);
+    }
+    a->ret = 1;
+    break;
+  }
   case 2: {
     char v[512];
     if (madeira_cfg_get(a->name, v, sizeof v)) {
@@ -6542,6 +6907,14 @@ static NTSTATUS _madeira_ctl(void *args) {
     }
     break;
   }
+  case 20: case 21: case 22:   /* madeira-bcd: native file access for the D3D12 shader cache
+                                * (tools/patch-winemetal-sc-native.py): open, get, put */
+    a->ret = madeira_scn_ctl(a);
+    break;
+  case 24:    /* madeira-bcd: late render-pass store actions (tools/patch-winemetal-rp-store.py) */
+    if (!a->ptr || a->len < sizeof(struct madeira_rp_store_req) || wmtr_enabled()) break;
+    a->ret = madeira_rp_store((const struct madeira_rp_store_req *)(uintptr_t)a->ptr);
+    break;
   default: break;
   }
   return STATUS_SUCCESS;
@@ -6847,6 +7220,8 @@ _MTLDevice_newGeometryEmulationPipelineState(void *obj) {
       d.objectFunction = fo;
       d.meshFunction = tm;
       d.fragmentFunction = ff;
+      if (!madeira_null_fs_fix((id<MTLDevice>)params->device, d, "DXIL tessellation"))   /* madeira-bcd */
+        return STATUS_SUCCESS;
       {
         MTLLinkedFunctions *ol = [MTLLinkedFunctions linkedFunctions], *ml = [MTLLinkedFunctions linkedFunctions];
         ol.functions = @[ fsi, th ];
@@ -6894,6 +7269,8 @@ _MTLDevice_newGeometryEmulationPipelineState(void *obj) {
     d.objectFunction = fo;
     d.meshFunction = fm;
     d.fragmentFunction = ff;
+    if (!madeira_null_fs_fix((id<MTLDevice>)params->device, d, "geometry-emulation"))   /* madeira-bcd */
+      return STATUS_SUCCESS;
     {
       MTLLinkedFunctions *lf = [MTLLinkedFunctions linkedFunctions];
       lf.functions = @[ fsi ];

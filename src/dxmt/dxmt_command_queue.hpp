@@ -392,6 +392,15 @@ public:
     return {block.buffer, offset, block.gpu_address};
   }
 
+#if defined(__i386__)  /* madeira-bcd: 32-bit (i386) builds only, as the fork shipped it */
+  /* madeira-bcd: short constant buffers -- the same, plus the block's GPU address */
+  std::tuple<void *, WMT::Buffer, uint64_t, uint64_t>
+  AllocateArgumentBufferGpu(uint64_t seq, size_t size) {
+    auto [block, offset] = argbuf_allocator.allocate(seq, cpu_coherent.signaledValue(), size, 64);
+    return {ptr_add(block.mapped_address, offset), block.buffer, offset, block.gpu_address};
+  }
+
+#endif
   std::tuple<void *, WMT::Buffer, uint64_t>
   AllocateArgumentBuffer(uint64_t seq, size_t size) {
     auto [block, offset] = argbuf_allocator.allocate(seq, cpu_coherent.signaledValue(), size, 64);

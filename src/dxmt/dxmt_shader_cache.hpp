@@ -5,7 +5,7 @@
 
 namespace dxmt {
 
-constexpr int kDXMTShaderCacheVersion = 16;
+constexpr int kDXMTShaderCacheVersion = 18; /* madeira-bcd: vertex fetch bounds; madeira-bcd: byte-aligned vertex fetch */
 
 // Base directory every DXMT cache lives under, so the Metal shader cache and
 // this one cannot disagree about where that is.

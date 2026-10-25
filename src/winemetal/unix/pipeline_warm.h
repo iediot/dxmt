@@ -71,6 +71,10 @@ static int madeira_warm_submit(const struct madeira_warm_request *r, unsigned ki
   if (wmtr_enabled() || !r || !r->device || !r->info || kind > 2 || (kind == 1 && !r->vd)) return 0;
   dispatch_once(&once, ^{
     long long n = madeira_cfg_int("pso-warm", 0);
+    /* The first device trial regressed; do not keep this speculative path
+     * active just because an older game profile already says pso-warm=2.
+     * Separate explicit opt-in allows a controlled same-build comparison. */
+    if (!madeira_cfg_int("pso-warm-native", 0)) n = 0;
     madeira_warm_workers = n <= 0 ? 0 : n > 2 ? 2 : (unsigned)n;
     for (unsigned i = 0; i < madeira_warm_workers; i++)
       madeira_warm_queues[i] = dispatch_queue_create("madeira.pso-warm",
@@ -78,6 +82,7 @@ static int madeira_warm_submit(const struct madeira_warm_request *r, unsigned ki
     if (madeira_warm_workers)
       fprintf(stderr, "[pso-warm] native handler active: %u workers, %u pending cap, 256MB headroom floor\n",
               madeira_warm_workers, MADEIRA_WARM_PENDING);
+    else fprintf(stderr, "[pso-warm] native warmer off; experimental opt-in requires pso-warm-native=1 and pso-warm>0\n");
   });
   if (!madeira_warm_workers) return 0;
   if (!madeira_warm_headroom()) { atomic_fetch_add(&madeira_warm_skipped, 1); return 1; }

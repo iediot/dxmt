@@ -188,6 +188,10 @@ public:
   MTLD3D11DeviceContextState(MTLD3D11Device *pDevice)
       : MTLD3D11DeviceChild<ID3DDeviceContextState>(pDevice) {}
 
+  /* madeira-bcd: context state swap -- the state this object holds while
+     it is not the active one (tools/patch-dxmt-context-state-swap.py) */
+  D3D11ContextState state;
+
   ~MTLD3D11DeviceContextState() {}
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject) {

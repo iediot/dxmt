@@ -115,13 +115,15 @@ void handle_signature_vs(
       if (sig.mask() == 0) break;
       signature_handlers.push_back(
         [=, type = (InputAttributeComponentType)sig.componentType(),
-         name = sig.fullSemanticString()](SignatureContext &ctx) {
+         name = sig.fullSemanticString(),
+         madeira_sm4 = sm50_shader->madeira_sm_major < 5](SignatureContext &ctx) {
           if (ctx.ia_layout) {
             for (unsigned i = 0; i < ctx.ia_layout->num_elements; i++) {
               if (ctx.ia_layout->elements[i].reg == reg) {
                 ctx.prologue << pull_vertex_input(
                   ctx.func_signature, reg, mask, ctx.ia_layout->elements[i],
-                  ctx.ia_layout->slot_mask
+                  ctx.ia_layout->slot_mask,
+                  madeira_sm4 /* madeira-bcd: vertex fetch bounds */
                 );
                 break;
               }

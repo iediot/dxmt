@@ -687,6 +687,9 @@ StateObjectCache<D3D11_SAMPLER_DESC, D3D11SamplerState>::CreateStateObject(
   }
 
   WMTSamplerInfo info;
+  /* every byte: winemetal reads a reduction tag from the padding after
+   * support_argument_buffers (madeira-bcd sampler reduction) */
+  memset(&info, 0, sizeof(info));
 
   info.lod_average = false;
   info.mip_filter = WMTSamplerMipFilterNotMipmapped;

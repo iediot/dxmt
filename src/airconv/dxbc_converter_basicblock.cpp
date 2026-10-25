@@ -25,8 +25,14 @@
 #include "llvm/Support/Error.h"
 #include "llvm/Support/raw_ostream.h"
 #include <stack>
+#include <cstdio>
+#include <cstdlib>
 
 char dxmt::UnsupportedFeature::ID;
+
+namespace dxmt::air {
+extern thread_local int madeira_vfetch_align1; /* madeira-bcd: byte-aligned vertex fetch */
+}
 
 namespace dxmt::dxbc {
 
@@ -426,7 +432,8 @@ pop_mesh_output_vertex_data(
 
 IREffect pull_vertex_input(
   air::FunctionSignatureBuilder &func_signature, uint32_t to_reg, uint32_t mask,
-  SM50_IA_INPUT_ELEMENT element_info, uint32_t slot_mask
+  SM50_IA_INPUT_ELEMENT element_info, uint32_t slot_mask,
+  bool madeira_sm4 /* madeira-bcd: vertex fetch bounds */
 ) {
   auto vbuf_table = func_signature.DefineInput(air::ArgumentBindingBuffer{
     .buffer_size = {},
@@ -484,9 +491,45 @@ IREffect pull_vertex_input(
       builder.CreateMul(stride, index),
       builder.getInt32(element_info.aligned_byte_offset)
     );
+    /* madeira-bcd: vertex fetch bounds (tools/patch-dxmt-vfetch-bounds.py) --
+     * D3D10 reads zero past the end of the binding; route such a fetch to the
+     * null-binding branch of pull_vec4_from_addr instead of reading on.
+     * Default: SM 4.x shaders only (madeira_sm4); env 1 = all, 0 = none. */
+    static int madeira_vfetch_mode = -1;
+    static unsigned madeira_vfetch_logged;
+    if (madeira_vfetch_mode < 0) {
+      const char *e = getenv("MADEIRA_VFETCH_BOUNDS");
+      madeira_vfetch_mode = (e && e[0] == '0') ? 0 : (e && e[0] == '1') ? 1 : 2;
+      fprintf(stderr, "[vfetch-bounds] madeira-bcd DXBC vertex fetch bounds %s\n",
+              madeira_vfetch_mode == 0 ? "off (MADEIRA_VFETCH_BOUNDS=0)"
+              : madeira_vfetch_mode == 1 ? "on for every shader (MADEIRA_VFETCH_BOUNDS=1)"
+                                         : "on for SM 4.x vertex shaders");
+    }
+    bool madeira_bounds = madeira_vfetch_mode == 1 || (madeira_vfetch_mode == 2 && madeira_sm4);
+    if (madeira_bounds && ++madeira_vfetch_logged <= 4)
+      fprintf(stderr, "[vfetch-bounds] madeira-bcd bounded attribute (reg %u, slot %u, #%u)\n",
+              (unsigned)element_info.reg, (unsigned)element_info.slot, madeira_vfetch_logged);
+    if (madeira_bounds) {
+      auto vb_length = builder.CreateExtractValue(vertex_buffer_entry, {2});
+      base_addr = builder.CreateSelect(
+        builder.CreateICmpULT(byte_offset, vb_length), base_addr,
+        llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(base_addr->getType()))
+      );
+    }
+    static int madeira_align_mode = -1;
+    if (madeira_align_mode < 0) {
+      const char *e = getenv("MADEIRA_VFETCH_ALIGN1");
+      madeira_align_mode = (e && e[0] == '0') ? 0 : (e && e[0] == '1') ? 1 : 2;
+      fprintf(stderr, "[vfetch-align] madeira-bcd byte-aligned vertex fetch %s\n",
+              madeira_align_mode == 0 ? "off (MADEIRA_VFETCH_ALIGN1=0)"
+              : madeira_align_mode == 1 ? "on for every shader (MADEIRA_VFETCH_ALIGN1=1)"
+                                        : "on for SM 4.x vertex shaders");
+    }
+    air::madeira_vfetch_align1 = madeira_align_mode == 1 || (madeira_align_mode == 2 && madeira_sm4);
     auto vec4 = co_yield air::pull_vec4_from_addr(
       (air::MTLAttributeFormat)element_info.format, base_addr, byte_offset
     );
+    air::madeira_vfetch_align1 = 0;
     if (vec4->getType() == types._float4) {
       co_yield store_at_vec4_array_masked(
         ctx.resource.input.ptr_float4, builder.getInt32(element_info.reg), vec4,

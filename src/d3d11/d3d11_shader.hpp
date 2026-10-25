@@ -211,6 +211,11 @@ public:
   virtual MTL_SHADER_REFLECTION &reflection() = 0;
   virtual MTL_SM50_SHADER_ARGUMENT *constant_buffers_info() = 0;
   virtual MTL_SM50_SHADER_ARGUMENT *arguments_info() = 0;
+#if defined(__i386__)  /* madeira-bcd: 32-bit (i386) builds only, as the fork shipped it */
+  /* madeira-bcd: short constant buffers -- dcl_constantbuffer size (vec4)
+   * per slot cb0..cb13, 0 when not declared or not known. */
+  virtual const uint16_t *cb_declared_vec4() = 0;
+#endif
   virtual CompiledShader *get_shader(ShaderVariant variant) = 0;
   virtual const Sha1Digest& sha1() = 0;
   virtual void dump() = 0;

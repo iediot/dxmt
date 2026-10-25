@@ -40,11 +40,18 @@ AIRBuilderResult call_unpack_impl(
   co_return ctx.builder.CreateCall(fn, {src});
 };
 
+/* madeira-bcd: byte-aligned vertex fetch (tools/patch-dxmt-vb-align.py) -- set
+ * by pull_vertex_input around an SM 4.x vertex attribute pull; builder ops run
+ * synchronously on the converting thread. */
+thread_local int madeira_vfetch_align1 = 0;
+
 AIRBuilderResult load_from_device_buffer(
   llvm::Type *value_type, pvalue base_addr, pvalue aligned_offest,
   uint32_t element_offset, uint32_t align
 ) {
   auto ctx = co_yield get_context();
+  if (madeira_vfetch_align1)
+    align = 1;
   co_return ctx.builder.CreateAlignedLoad(
     value_type,
     ctx.builder.CreateConstGEP1_32(
