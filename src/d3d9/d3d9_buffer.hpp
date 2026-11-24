@@ -93,8 +93,7 @@ public:
   size() const {
     return m_size;
   }
-  // Host-mapped pointer to the authoritative vertex data. Callers must
-  // null-check.
+  // Host-mapped pointer to the authoritative vertex data. Callers must null-check.
   const void *
   hostPointer() const {
     return m_hostPtr;

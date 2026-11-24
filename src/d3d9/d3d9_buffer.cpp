@@ -3,6 +3,8 @@
 #include "d3d9_debug.hpp"
 
 #include <algorithm>
+#include <tuple>
+#include <utility>
 
 #include "d3d9_device.hpp"
 #include "d3d9_private_data.hpp"
@@ -87,10 +89,13 @@ recordRefresh(bool inplace, bool fallback, uint64_t bytes, size_t pages) {
                  stats.inplace ? double(stats.pages) / stats.inplace : 0.0));
 }
 
+// sequences() returns {current command sequence, coherent signal}. The buffer
+// classes (device friends) supply it, so a retry after a drain reads them fresh.
+template <typename Sequences>
 bool
 refreshMirror(MTLD3D9Device *device, DynamicBuffer *dynamic, void *mirror, UINT size,
               bool watched, D3D9BufferRefreshState &state, std::vector<void *> &pages,
-              uint64_t current_seq, uint64_t coherent_seq) {
+              Sequences sequences) {
   bool fallback = !watched;
 #if defined(_WIN32) && !defined(DXMT_MADEIRA)
   if (watched && !state.whole) {
@@ -151,13 +156,29 @@ refreshMirror(MTLD3D9Device *device, DynamicBuffer *dynamic, void *mirror, UINT 
   // First publication, DISCARD, plain write locks and unsupported/failed watch
   // queries keep the old rename + whole-mirror path. Lock's declared extent
   // cannot replace this: measured games write well beyond it.
+  auto [current_seq, coherent_seq] = sequences();
   if (FAILED(renameDynamicBuffer(device, dynamic, current_seq, coherent_seq))) {
-    static bool warned = false;
-    if (!warned) {
-      warned = true;
-      Logger::warn("d3d9: out of video memory refreshing a dynamic buffer; the draw reads stale contents");
+    // madeira-bcd (upstream 0a690ad7, GTA IV, JA13M8): no room for a new
+    // generation. Wait for the GPU to finish what is recorded
+    // (MTLD3D9Device::drainForDynamicRename) and try again: a released
+    // generation is recycled, and with none to recycle the store goes into the
+    // current generation, which no unfinished draw reads now. The drain advanced
+    // the device sequence and coherent signal, so the retry reads them fresh.
+    // Calling thread under the device lock, between draws (BuildDrawCapture).
+    if (device->drainForDynamicRename()) {
+      std::tie(current_seq, coherent_seq) = sequences();
+      if (FAILED(renameDynamicBuffer(device, dynamic, current_seq, coherent_seq)))
+        device->noteRenameInPlace();
+    } else {
+      // Video memory is exhausted (or DXMT_D9_RENAME_WAIT=0), so the cache keeps
+      // the previous generation and the draw reads one refresh of stale geometry.
+      static bool warned = false;
+      if (!warned) {
+        warned = true;
+        Logger::warn("d3d9: out of video memory refreshing a dynamic buffer; the draw reads stale contents");
+      }
+      return false;
     }
-    return false;
   }
   dynamic->immediateName()->updateContents(0, mirror, size, dynamic->immediateSuballocation());
   state.refreshed();
@@ -221,8 +242,10 @@ void
 MTLD3D9VertexBuffer::refreshWholeMirror() {
   if (m_aliased || !m_dirty)
     return;
-  if (refreshMirror(m_device, m_dynamic.ptr(), m_hostPtr, m_size, m_writeWatch, m_refreshState, m_writtenPages,
-                    m_device->m_currentCmdSeq, m_device->m_cachedSignaled.load(std::memory_order_acquire)))
+  if (refreshMirror(m_device, m_dynamic.ptr(), m_hostPtr, m_size, m_writeWatch, m_refreshState, m_writtenPages, [this] {
+                      return std::pair<uint64_t, uint64_t>{m_device->m_currentCmdSeq,
+                                                           m_device->m_cachedSignaled.load(std::memory_order_acquire)};
+                    }))
     // A held lock may write again without another Lock. Watch is reset at each
     // refresh, so the next draw publishes only the pages written since then.
     m_dirty = m_writeLocked;
@@ -522,8 +545,10 @@ void
 MTLD3D9IndexBuffer::refreshWholeMirror() {
   if (m_aliased || !m_dirty)
     return;
-  if (refreshMirror(m_device, m_dynamic.ptr(), m_hostPtr, m_size, m_writeWatch, m_refreshState, m_writtenPages,
-                    m_device->m_currentCmdSeq, m_device->m_cachedSignaled.load(std::memory_order_acquire)))
+  if (refreshMirror(m_device, m_dynamic.ptr(), m_hostPtr, m_size, m_writeWatch, m_refreshState, m_writtenPages, [this] {
+                      return std::pair<uint64_t, uint64_t>{m_device->m_currentCmdSeq,
+                                                           m_device->m_cachedSignaled.load(std::memory_order_acquire)};
+                    }))
     // A held lock may write again without another Lock. Watch is reset at each
     // refresh, so the next draw publishes only the pages written since then.
     m_dirty = m_writeLocked;
