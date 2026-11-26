@@ -7305,6 +7305,27 @@ static uint32_t madeira_rp_store(const struct madeira_rp_store_req *r) {
   return 1;
 }
 
+/* madeira-bcd end-fuse: MadeiraCtl op 25 from madeira-d3d12. An encoder's last
+ * queued command chain (encode-batch), its late store actions (op 24's request,
+ * when has_store) and its endEncoding, in one transition instead of up to three.
+ * The same calls in the same order on the same thread. kind: 0 render, 1
+ * compute, 2 blit. Encoder 0 is a probe; remote mode answers 0 (not fused). */
+struct madeira_enc_end_req { uint64_t enc, chain; uint32_t kind, has_store; struct madeira_rp_store_req store; };
+static uint32_t madeira_enc_end(const struct madeira_enc_end_req *r) {
+  struct unixcall_generic_obj_cmd_noret p;
+  if (!r->enc) return 1;
+  if (r->chain) {
+    p.encoder = r->enc;
+    p.cmd_head.ptr = (const void *)(uintptr_t)r->chain;
+    if (r->kind == 0) _MTLRenderCommandEncoder_encodeCommands(&p);
+    else if (r->kind == 1) _MTLComputeCommandEncoder_encodeCommands(&p);
+    else _MTLBlitCommandEncoder_encodeCommands(&p);
+  }
+  if (r->has_store && r->kind == 0 && r->store.enc == r->enc) madeira_rp_store(&r->store);
+  [(id<MTLCommandEncoder>)(uintptr_t)r->enc endEncoding];
+  return 1;
+}
+
 static NTSTATUS _madeira_ctl(void *args) {
   struct madeira_ctl_args *a = args;
   if (!a) return STATUS_SUCCESS;
@@ -7458,6 +7479,10 @@ static NTSTATUS _madeira_ctl(void *args) {
   case 24:    /* madeira-bcd: late render-pass store actions (tools/patch-winemetal-rp-store.py) */
     if (!a->ptr || a->len < sizeof(struct madeira_rp_store_req) || wmtr_enabled()) break;
     a->ret = madeira_rp_store((const struct madeira_rp_store_req *)(uintptr_t)a->ptr);
+    break;
+  case 25:    /* madeira-bcd end-fuse: last chain + late store actions + endEncoding in one call */
+    if (!a->ptr || a->len < sizeof(struct madeira_enc_end_req) || wmtr_enabled()) break;
+    a->ret = madeira_enc_end((const struct madeira_enc_end_req *)(uintptr_t)a->ptr);
     break;
   default: break;
   }
