@@ -103,6 +103,10 @@ extern void ios_frame_limiter(unsigned long long ns);
 static _Atomic uint64_t g_madeira_cmdbuf_inflight;
 extern int ios_frame_stats_on;
 extern void ios_frame_pass(unsigned kind, unsigned loads, unsigned stores, unsigned clears);
+/* ntdll-unix thread_ios.c: a thread that waits on the GPU timeline or builds
+ * pipelines is one a frame waits for; under an "exe:Game.exe=initiated" QoS rule
+ * it is lifted back to user-interactive (once per thread, a TLS check after that). */
+extern void ios_thread_qos_frame_critical(const char *why);
 
 /* Whether THIS caller's [frame] hooks run: only while the instrument is on
  * (ios_frame_stats_on), and -- because this file serves 64-bit callers too --
@@ -1790,6 +1794,7 @@ static obj_handle_t madeira_arch_create(id<MTLDevice> device, id descriptor, int
 static NTSTATUS
 _MTLDevice_newComputePipelineState(void *obj) {
   struct unixcall_mtldevice_newcomputepso *params = obj;
+  ios_thread_qos_frame_critical("pipeline builds");
   if (wmtr_enabled()) {
     uint8_t buf[sizeof(struct rm_wmt_info) + sizeof(struct WMTComputePipelineInfo)];
     struct rm_wmt_info *w = (void *)buf;
@@ -2058,6 +2063,7 @@ MTLMeshRenderPipelineDescriptor ()
 static NTSTATUS
 _MTLDevice_newRenderPipelineState(void *obj) {
   struct unixcall_mtldevice_newrenderpso *params = obj;
+  ios_thread_qos_frame_critical("pipeline builds");
   if (wmtr_enabled()) {
     /* The WHOLE descriptor crosses: eight colour attachments, blend factors,
      * write masks, depth/stencil formats, sample count, topology and
@@ -2156,6 +2162,7 @@ static NTSTATUS
 _MTLDevice_newRenderPipelineStateVD(void *obj) {
   struct unixcall_mtldevice_newrenderpso_vd *params = obj;
   const struct WMTVertexDescriptorInfo *vdi = params->vd.ptr;
+  ios_thread_qos_frame_critical("pipeline builds");
   if (wmtr_enabled()) {
     /* The WHOLE descriptor crosses: eight colour attachments, blend factors,
      * write masks, depth/stencil formats, sample count, topology and
@@ -6298,6 +6305,7 @@ _MTLDevice_registryID(void *obj) {
 static NTSTATUS
 _MTLSharedEvent_waitUntilSignaledValue(void *obj) {
   struct unixcall_mtlsharedevent_waituntilsignaledvalue *params = obj;
+  ios_thread_qos_frame_critical("GPU timeline wait");
   bool timeout = [(id<MTLSharedEvent>)params->event waitUntilSignaledValue:params->value timeoutMS:params->timeout_ms];
   params->ret_timeout = timeout;
   return STATUS_SUCCESS;
